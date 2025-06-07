@@ -1,0 +1,11 @@
+[package]
+name = "sfo-io"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/wugren/sfo-io.git"
+license-file = "LICENSE"
+description = "A Rust library for handling IO operations, providing asynchronous read/write and stream processing capabilities."
+
+[dependencies]
+tokio = { version = "1", features = ["io-std", "rt-multi-thread"] }
+async-trait = "0.1.88"
