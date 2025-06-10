@@ -164,3 +164,76 @@ impl<T: SimpleAsyncWrite> AsyncWrite for SimpleAsyncWriteHolder<T> {
         Poll::Ready(Ok(()))
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use crate::{SimpleAsyncRead, SimpleAsyncReadHolder, SimpleAsyncWrite, SimpleAsyncWriteHolder};
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::AsyncReadExt;
+
+    pub struct TestSimpleAsyncWrite {
+        buf: Arc<Mutex<Vec<u8>>>
+    }
+
+    impl TestSimpleAsyncWrite {
+        pub fn new(buf: Arc<Mutex<Vec<u8>>>) -> TestSimpleAsyncWrite {
+            TestSimpleAsyncWrite {
+                buf,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SimpleAsyncWrite for TestSimpleAsyncWrite {
+        async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            {
+                let mut buffer = self.buf.lock().unwrap();
+                buffer.extend_from_slice(buf);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub struct TestSimpleAsyncRead {
+        buf: Arc<Mutex<Vec<u8>>>
+    }
+
+    impl TestSimpleAsyncRead {
+        pub fn new(buf: Arc<Mutex<Vec<u8>>>) -> TestSimpleAsyncRead {
+            TestSimpleAsyncRead { buf }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SimpleAsyncRead for TestSimpleAsyncRead {
+        async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            let mut buffer = self.buf.lock().unwrap();
+            let len = buffer.len();
+            buf.copy_from_slice(&buffer[..len]);
+            Ok(buf.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_simple_async_io() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut write = SimpleAsyncWriteHolder::new(TestSimpleAsyncWrite::new(buf.clone()));
+        let data = "tttt".to_string();
+        write.write_all(data.as_bytes()).await.unwrap();
+        write.flush().await.unwrap();
+
+        let mut read = SimpleAsyncReadHolder::new(TestSimpleAsyncRead::new(buf.clone()));
+        let mut buf = [0u8; 4];
+
+        read.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(buf.as_slice()), data);
+    }
+}
