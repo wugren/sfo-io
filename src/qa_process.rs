@@ -22,7 +22,6 @@ impl QAProcess {
 
     pub async fn answer(&mut self, question: &str, answer: &str) -> SfoIOResult<()> {
         // self.stdin.as_mut().unwrap().write_all(answer.as_bytes()).await.map_err(into_sfoio_err!(SfoIOErrorCode::Failed))?;
-        log::info!("{} start", question);
         let mut offset = 0;
         let mut buf = [0u8; 4096];
         let mut error_buf = [0u8; 4096];
@@ -84,7 +83,6 @@ impl QAProcess {
                 }
             }
         }
-        log::info!("{} complete", question);
         Ok(())
     }
 
@@ -103,7 +101,6 @@ impl QAProcess {
 }
 
 pub async fn execute(cmd: &str) -> SfoIOResult<Vec<u8>> {
-    log::info!("{}", cmd);
     let mut lexer = Shlex::new(cmd);
     let args: Vec<String> = lexer.by_ref().collect();
     let output = tokio::process::Command::new(args[0].as_str())
@@ -112,7 +109,6 @@ pub async fn execute(cmd: &str) -> SfoIOResult<Vec<u8>> {
         .await
         .map_err(into_sfoio_err!(SfoIOErrorCode::Failed))?;
     if output.status.success() {
-        log::info!("success:{}", String::from_utf8_lossy(output.stdout.as_slice()));
         Ok(output.stdout)
     } else {
         Err(sfoio_err!(SfoIOErrorCode::CmdReturnFailed, "{}", String::from_utf8_lossy(output.stderr.as_slice())))
@@ -120,7 +116,6 @@ pub async fn execute(cmd: &str) -> SfoIOResult<Vec<u8>> {
 }
 
 pub async fn spawn(cmd: &str) -> SfoIOResult<QAProcess> {
-    log::info!("{}\n", cmd);
     let mut lexer = Shlex::new(cmd);
     let args: Vec<String> = lexer.by_ref().collect();
     let child = tokio::process::Command::new(args[0].as_str())
