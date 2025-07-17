@@ -90,12 +90,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "log"
-version = "0.4.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
-
-[[package]]
 name = "memchr"
 version = "2.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -200,10 +194,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sfo-io"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
- "log",
  "sfo-result",
  "shlex",
  "tokio",
@@ -211,9 +204,9 @@ dependencies = [
 
 [[package]]
 name = "sfo-result"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12256febb90f624bf25a5eeaed19e74b78a1348c5883aaecb5bd418c41b2f729"
+checksum = "529b9681e5ff855d98c250299009cba396206cfe7d7407b88b44e275bc1df869"
 
 [[package]]
 name = "shlex"
