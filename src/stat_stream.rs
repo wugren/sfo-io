@@ -10,10 +10,10 @@ use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub trait SpeedStat: 'static + Send + Sync {
-    fn get_upload_speed(&self) -> u64;
-    fn get_upload_sum_size(&self) -> u64;
-    fn get_download_speed(&self) -> u64;
-    fn get_download_sum_size(&self) -> u64;
+    fn get_write_speed(&self) -> u64;
+    fn get_write_sum_size(&self) -> u64;
+    fn get_read_speed(&self) -> u64;
+    fn get_read_sum_size(&self) -> u64;
 }
 
 pub trait TimePicker: 'static + Sync + Send {
@@ -156,19 +156,19 @@ impl<T: TimePicker> SpeedStatImpl<T> {
 }
 
 impl<T: TimePicker> SpeedStat for SpeedStatImpl<T> {
-    fn get_upload_speed(&self) -> u64 {
+    fn get_write_speed(&self) -> u64 {
         self.upload_state.lock().unwrap().get_speed()
     }
 
-    fn get_upload_sum_size(&self) -> u64 {
+    fn get_write_sum_size(&self) -> u64 {
         self.upload_state.lock().unwrap().get_sum_size()
     }
 
-    fn get_download_speed(&self) -> u64 {
+    fn get_read_speed(&self) -> u64 {
         self.download_state.lock().unwrap().get_speed()
     }
 
-    fn get_download_sum_size(&self) -> u64 {
+    fn get_read_sum_size(&self) -> u64 {
         self.download_state.lock().unwrap().get_sum_size()
     }
 }
@@ -579,8 +579,8 @@ mod tests {
         stat.add_download_data(200);
 
         // 由于没有时间流逝，速度为0
-        assert_eq!(stat.get_upload_speed(), 0);
-        assert_eq!(stat.get_download_speed(), 0);
+        assert_eq!(stat.get_write_speed(), 0);
+        assert_eq!(stat.get_read_speed(), 0);
 
         // 模拟时间流逝后再次检查
         set_mock_time(5000);
@@ -591,8 +591,8 @@ mod tests {
         stat.add_download_data(0);
 
         // 现在应该有速度了
-        assert!(stat.get_upload_speed() > 0);
-        assert!(stat.get_download_speed() > 0);
+        assert!(stat.get_write_speed() > 0);
+        assert!(stat.get_read_speed() > 0);
     }
 
     // 注意: StatStream的测试需要tokio运行时，这里省略了复杂的AsyncRead/AsyncWrite mock
@@ -695,13 +695,13 @@ mod tests {
             download_size += size;
             advance_mock_time(1000);
             if i < 5 {
-                assert_eq!(speed_stat.get_upload_speed(), (upload_size / 5) as u64);
-                assert_eq!(speed_stat.get_download_speed(), (download_size / 5) as u64);
+                assert_eq!(speed_stat.get_write_speed(), (upload_size / 5) as u64);
+                assert_eq!(speed_stat.get_read_speed(), (download_size / 5) as u64);
             } else {
-                assert_eq!(speed_stat.get_upload_sum_size(), upload_size as u64);
-                assert_eq!(speed_stat.get_download_sum_size(), download_size as u64);
-                assert_eq!(speed_stat.get_upload_speed(), (4096 * 5 - 2048)/5);
-                assert_eq!(speed_stat.get_download_speed(), (10 * 5 - 5)/5);
+                assert_eq!(speed_stat.get_write_sum_size(), upload_size as u64);
+                assert_eq!(speed_stat.get_read_sum_size(), download_size as u64);
+                assert_eq!(speed_stat.get_write_speed(), (4096 * 5 - 2048)/5);
+                assert_eq!(speed_stat.get_read_speed(), (10 * 5 - 5)/5);
             }
         }
         stat_stream.shutdown().await.unwrap();
