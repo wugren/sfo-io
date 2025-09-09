@@ -199,6 +199,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> StatStre
     pub fn get_speed_stat(&self) -> Arc<dyn SpeedStat> {
         self.stat.clone()
     }
+
+    pub fn raw_stream(&mut self) -> &mut T {
+        &mut self.stream
+    }
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> AsyncRead for StatStream<T, S> {
