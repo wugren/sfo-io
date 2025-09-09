@@ -215,7 +215,7 @@ mod test {
     impl SimpleAsyncRead for TestSimpleAsyncRead {
         async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-            let mut buffer = self.buf.lock().unwrap();
+            let buffer = self.buf.lock().unwrap();
             let len = buffer.len();
             buf.copy_from_slice(&buffer[..len]);
             Ok(buf.len())
