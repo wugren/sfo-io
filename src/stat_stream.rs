@@ -3,10 +3,12 @@
 use std::io;
 use std::io::Error;
 use std::marker::PhantomData;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
+use nonzero_ext::nonzero;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub trait SpeedStat: 'static + Send + Sync {
@@ -36,15 +38,17 @@ struct DataItem {
 pub(crate) struct SpeedState<T: TimePicker> {
     sum_size: u64,
     last_time: u128,
+    speed_duration: NonZeroU64,
     data_items: Vec<DataItem>,
     _time_picker: PhantomData<T>,
 }
 
 impl<T: TimePicker> SpeedState<T> {
-    fn new() -> SpeedState<T> {
+    fn new(speed_duration: NonZeroU64) -> SpeedState<T> {
         SpeedState {
             sum_size: 0,
             last_time: T::now(),
+            speed_duration,
             data_items: vec![],
             _time_picker: Default::default(),
         }
@@ -102,7 +106,6 @@ impl<T: TimePicker> SpeedState<T> {
                 pos += offset;
                 offset = 1000;
                 sec += 1;
-                println!("{} {} {}", pos, offset, duration);
             }
 
         }
@@ -112,7 +115,7 @@ impl<T: TimePicker> SpeedState<T> {
     pub fn clear_invalid_item(&mut self, now: u128) {
         let now = (now / 1000) as u64;
         self.data_items.retain(|item| {
-            (now - item.time) <= 5
+            (now - item.time) <= self.speed_duration.get()
         });
     }
 
@@ -120,12 +123,12 @@ impl<T: TimePicker> SpeedState<T> {
         let now = (T::now() / 1000) as u64;
         let mut sum_size = 0;
         for item in self.data_items.iter() {
-            if (now - item.time) <= 5 && now != item.time {
+            if (now - item.time) <= self.speed_duration.get() && now != item.time {
                 sum_size += item.size;
             }
         }
 
-        sum_size / 5
+        sum_size / self.speed_duration
     }
 
     pub fn get_sum_size(&self) -> u64 {
@@ -133,29 +136,45 @@ impl<T: TimePicker> SpeedState<T> {
     }
 }
 
-struct SpeedStatImpl<T: TimePicker> {
+pub struct SfoSpeedStat<T: TimePicker = SystemTimePicker> {
     upload_state: Mutex<SpeedState<T>>,
     download_state: Mutex<SpeedState<T>>,
 }
 
-impl<T: TimePicker> SpeedStatImpl<T> {
-    pub fn new() -> SpeedStatImpl<T> {
-        SpeedStatImpl {
-            upload_state: Mutex::new(SpeedState::new()),
-            download_state: Mutex::new(SpeedState::new()),
+impl<T: TimePicker> SfoSpeedStat<T> {
+    pub fn new() -> SfoSpeedStat<T> {
+        SfoSpeedStat {
+            upload_state: Mutex::new(SpeedState::new(nonzero!(5u64))),
+            download_state: Mutex::new(SpeedState::new(nonzero!(5u64))),
         }
     }
 
-    pub fn add_upload_data(&self, size: u64) {
+    
+    /// Creates a new SfoSpeedStat instance with the specified duration
+    /// 
+    /// # Parameters
+    /// * `duration` - The duration for statistics, in seconds
+    /// 
+    /// # Returns
+    /// Returns a new SfoSpeedStat instance containing initialized upload and download states
+    pub fn new_with_duration(duration: u64) -> SfoSpeedStat<T> {
+        SfoSpeedStat {
+            upload_state: Mutex::new(SpeedState::new(NonZeroU64::new(duration).unwrap())),
+            download_state: Mutex::new(SpeedState::new(NonZeroU64::new(duration).unwrap())),
+        }
+    }
+
+
+    pub fn add_write_data_size(&self, size: u64) {
         self.upload_state.lock().unwrap().add_data(size);
     }
 
-    pub fn add_download_data(&self, size: u64) {
+    pub fn add_read_data_size(&self, size: u64) {
         self.download_state.lock().unwrap().add_data(size);
     }
 }
 
-impl<T: TimePicker> SpeedStat for SpeedStatImpl<T> {
+impl<T: TimePicker> SpeedStat for SfoSpeedStat<T> {
     fn get_write_speed(&self) -> u64 {
         self.upload_state.lock().unwrap().get_speed()
     }
@@ -175,14 +194,14 @@ impl<T: TimePicker> SpeedStat for SpeedStatImpl<T> {
 
 pub struct StatStream<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker = SystemTimePicker> {
     stream: T,
-    stat: Arc<SpeedStatImpl<S>>,
+    stat: Arc<SfoSpeedStat<S>>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
     pub fn new(stream: T) -> StatStream<T> {
         StatStream {
             stream,
-            stat: Arc::new(SpeedStatImpl::new()),
+            stat: Arc::new(SfoSpeedStat::new()),
         }
     }
 
@@ -192,7 +211,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> StatStre
     pub(crate) fn new_test(stream: T) -> StatStream<T, S> {
         StatStream {
             stream,
-            stat: Arc::new(SpeedStatImpl::new()),
+            stat: Arc::new(SfoSpeedStat::new()),
         }
     }
 
@@ -214,7 +233,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> AsyncRea
         match Pin::new(&mut self.stream).poll_read(cx, buf) {
             Poll::Ready(res) => {
                 if res.is_ok() {
-                    self.stat.add_download_data(buf.filled().len() as u64);
+                    self.stat.add_read_data_size(buf.filled().len() as u64);
                 }
                 Poll::Ready(res)
             },
@@ -232,7 +251,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> AsyncWri
         match Pin::new(&mut self.stream).poll_write(cx, buf) {
             Poll::Ready(res) => {
                 if res.is_ok() {
-                    self.stat.add_upload_data(buf.len() as u64);
+                    self.stat.add_write_data_size(buf.len() as u64);
                 }
                 Poll::Ready(res)
             },
@@ -283,7 +302,7 @@ mod tests {
         }
 
         set_mock_time(1000);
-        let state: SpeedState<MockTimePicker> = SpeedState::new();
+        let state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
 
         assert_eq!(state.sum_size, 0);
         assert_eq!(state.last_time, 1000);
@@ -314,7 +333,7 @@ mod tests {
         }
 
         set_mock_time(1500);
-        let mut state: SpeedState<MockTimePicker> = SpeedState::new();
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
 
         state.add_data(100);
         assert_eq!(state.sum_size, 100);
@@ -352,7 +371,7 @@ mod tests {
         }
 
         set_mock_time(1000);
-        let mut state: SpeedState<MockTimePicker> = SpeedState::new();
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
 
         state.add_data(100);
         advance_mock_time(2000); // 时间前进到3000ms
@@ -401,7 +420,7 @@ mod tests {
 
         // 测试跨秒时数据如何分配到不同的秒中
         set_mock_time(1500); // 1.5秒
-        let mut state: SpeedState<MockTimePicker> = SpeedState::new();
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
         advance_mock_time(1500);
 
         // 从1500ms到3000ms，增加1500ms，跨越2个完整的秒(2s和3s)
@@ -421,7 +440,7 @@ mod tests {
 
         // 测试跨秒时数据如何分配到不同的秒中
         set_mock_time(1500); // 1.5秒
-        let mut state: SpeedState<MockTimePicker> = SpeedState::new();
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
         advance_mock_time(2000);
 
         // 从1500ms到3000ms，增加1500ms，跨越2个完整的秒(2s和3s)
@@ -465,7 +484,7 @@ mod tests {
             MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
         }
 
-        let mut state: SpeedState<MockTimePicker> = SpeedState::new();
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
 
         // 添加几个不同时间的数据项
         state.data_items.push(DataItem { size: 100, time: 5 }); // 5秒时的数据，应该被清除
@@ -504,7 +523,7 @@ mod tests {
         }
 
         set_mock_time(10000); // 10秒
-        let mut state: SpeedState<MockTimePicker> = SpeedState::new();
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
 
         state.add_data(100);
         advance_mock_time(1000);
@@ -548,7 +567,7 @@ mod tests {
             MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
         }
 
-        let mut state: SpeedState<MockTimePicker> = SpeedState::new();
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(10u64));
         state.add_data(100);
         state.add_data(200);
         assert_eq!(state.get_sum_size(), 300);
@@ -577,10 +596,10 @@ mod tests {
             MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
         }
 
-        let stat: SpeedStatImpl<MockTimePicker> = SpeedStatImpl::new();
+        let stat: SfoSpeedStat<MockTimePicker> = SfoSpeedStat::new();
 
-        stat.add_upload_data(100);
-        stat.add_download_data(200);
+        stat.add_write_data_size(100);
+        stat.add_read_data_size(200);
 
         // 由于没有时间流逝，速度为0
         assert_eq!(stat.get_write_speed(), 0);
@@ -588,11 +607,11 @@ mod tests {
 
         // 模拟时间流逝后再次检查
         set_mock_time(5000);
-        stat.add_upload_data(500);
-        stat.add_download_data(1000);
+        stat.add_write_data_size(500);
+        stat.add_read_data_size(1000);
         set_mock_time(6000);
-        stat.add_upload_data(0);
-        stat.add_download_data(0);
+        stat.add_write_data_size(0);
+        stat.add_read_data_size(0);
 
         // 现在应该有速度了
         assert!(stat.get_write_speed() > 0);
