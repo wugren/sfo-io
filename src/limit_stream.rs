@@ -398,7 +398,6 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use futures::task::noop_waker;
-    use nonzero_ext::NonZero;
 
     // Mock stream implementation for testing
     struct MockStream {
@@ -887,9 +886,9 @@ mod tests {
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_pending());
-        
+
         limit_stream.raw_stream().write_should_pending = false;
-        
+
         // 测试无限制写入
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_ready());
@@ -927,7 +926,7 @@ mod tests {
             }
         }
     }
-    
+
     #[tokio::test]
     async fn test_write_with_limit() {
         let mock_stream = MockStream::new(vec![]);
@@ -1155,7 +1154,7 @@ mod tests {
         assert!(result.is_pending());
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        
+
         let error = Error::new(ErrorKind::Other, "write error");
         limit_stream.raw_stream().write_error = Some(error);
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
@@ -1164,7 +1163,7 @@ mod tests {
             assert!(ret.is_err());
         }
     }
-    
+
     #[tokio::test]
     async fn test_read_error_propagation() {
         let error = Error::new(ErrorKind::Other, "read error");

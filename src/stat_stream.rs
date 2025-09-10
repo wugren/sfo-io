@@ -18,6 +18,11 @@ pub trait SpeedStat: 'static + Send + Sync {
     fn get_read_sum_size(&self) -> u64;
 }
 
+pub trait SpeedTracker: SpeedStat {
+    fn add_write_data_size(&self, size: u64);
+    fn add_read_data_size(&self, size: u64);
+}
+
 pub trait TimePicker: 'static + Sync + Send {
     fn now() -> u128;
 }
@@ -141,35 +146,45 @@ pub struct SfoSpeedStat<T: TimePicker = SystemTimePicker> {
     download_state: Mutex<SpeedState<T>>,
 }
 
-impl<T: TimePicker> SfoSpeedStat<T> {
-    pub fn new() -> SfoSpeedStat<T> {
-        SfoSpeedStat {
+impl SfoSpeedStat {
+    pub fn new() -> SfoSpeedStat {
+        Self {
             upload_state: Mutex::new(SpeedState::new(nonzero!(5u64))),
             download_state: Mutex::new(SpeedState::new(nonzero!(5u64))),
         }
     }
 
-    
+
     /// Creates a new SfoSpeedStat instance with the specified duration
-    /// 
+    ///
     /// # Parameters
     /// * `duration` - The duration for statistics, in seconds
-    /// 
+    ///
     /// # Returns
     /// Returns a new SfoSpeedStat instance containing initialized upload and download states
-    pub fn new_with_duration(duration: u64) -> SfoSpeedStat<T> {
+    pub fn new_with_duration(duration: u64) -> SfoSpeedStat {
         SfoSpeedStat {
             upload_state: Mutex::new(SpeedState::new(NonZeroU64::new(duration).unwrap())),
             download_state: Mutex::new(SpeedState::new(NonZeroU64::new(duration).unwrap())),
         }
     }
+}
 
+impl<T: TimePicker> SfoSpeedStat<T> {
+    pub(crate) fn new_with_time_picker() -> SfoSpeedStat<T> {
+        SfoSpeedStat {
+            upload_state: Mutex::new(SpeedState::new(nonzero!(5u64))),
+            download_state: Mutex::new(SpeedState::new(nonzero!(5u64))),
+        }
+    }
+}
 
-    pub fn add_write_data_size(&self, size: u64) {
+impl<T: TimePicker> SpeedTracker for SfoSpeedStat<T> {
+    fn add_write_data_size(&self, size: u64) {
         self.upload_state.lock().unwrap().add_data(size);
     }
 
-    pub fn add_read_data_size(&self, size: u64) {
+    fn add_read_data_size(&self, size: u64) {
         self.download_state.lock().unwrap().add_data(size);
     }
 }
@@ -192,9 +207,9 @@ impl<T: TimePicker> SpeedStat for SfoSpeedStat<T> {
     }
 }
 
-pub struct StatStream<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker = SystemTimePicker> {
+pub struct StatStream<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     stream: T,
-    stat: Arc<SfoSpeedStat<S>>,
+    stat: Arc<dyn SpeedTracker>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
@@ -205,13 +220,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
         }
     }
 
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> StatStream<T, S> {
-    pub(crate) fn new_test(stream: T) -> StatStream<T, S> {
+    pub fn new_with_tracker(stream: T, tracker: Arc<dyn SpeedTracker>) -> StatStream<T> {
         StatStream {
             stream,
-            stat: Arc::new(SfoSpeedStat::new()),
+            stat: tracker,
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
+    pub(crate) fn new_test<S: TimePicker>(stream: T) -> StatStream<T> {
+        StatStream {
+            stream,
+            stat: Arc::new(SfoSpeedStat::<S>::new_with_time_picker()),
         }
     }
 
@@ -224,7 +245,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> StatStre
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> AsyncRead for StatStream<T, S> {
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for StatStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -242,7 +263,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> AsyncRea
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static, S: TimePicker> AsyncWrite for StatStream<T, S> {
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatStream<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -596,7 +617,7 @@ mod tests {
             MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
         }
 
-        let stat: SfoSpeedStat<MockTimePicker> = SfoSpeedStat::new();
+        let stat: SfoSpeedStat<MockTimePicker> = SfoSpeedStat::new_with_time_picker();
 
         stat.add_write_data_size(100);
         stat.add_read_data_size(200);
@@ -704,7 +725,7 @@ mod tests {
         let stream = MockStream{
             future: None,
         };
-        let mut stat_stream = StatStream::<_, MockTimePicker>::new_test(stream);
+        let mut stat_stream = StatStream::new_test::<MockTimePicker>(stream);
         let speed_stat = stat_stream.get_speed_stat();
         let mut upload_size = 0;
         let mut download_size = 0;
