@@ -9,6 +9,7 @@ use governor::{clock, RateLimiter};
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use nonzero_ext::nonzero;
+use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub trait Limit: 'static + Sync + Send {
@@ -19,35 +20,291 @@ pub type LimitRef = Arc<dyn Limit>;
 
 enum ReadState {
     Idle,
-    Waiting(Option<(Pin<Box<dyn Future<Output=()> + Send + 'static>>, usize, usize)>),
+    Waiting(Option<(Pin<Box<dyn Future<Output=()> + Send + Sync + 'static>>, usize, usize)>),
     Reading(Option<(usize, usize)>),
 }
 
 enum WriteState {
     Idle,
-    Waiting(Option<(Pin<Box<dyn Future<Output=()> + Send + 'static>>, usize, usize)>),
+    Waiting(Option<(Pin<Box<dyn Future<Output=()> + Send + Sync + 'static>>, usize, usize)>),
     Writing(Option<(usize, usize)>),
 }
 
+#[pin_project]
 pub struct LimitStream<S: AsyncRead + AsyncWrite + Unpin + Send> {
-    stream: S,
+    #[pin]
+    read: LimitRead<sfo_split::ReadHalf<S>>,
+    #[pin]
+    write: LimitWrite<sfo_split::WriteHalf<S>>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> LimitStream<S> {
+    pub fn new(stream: S, limit: LimitRef) -> Self {
+        let (read, write) = sfo_split::split(stream);
+        let limit_read = LimitRead::new(read, limit.clone());
+        let limit_write = LimitWrite::new(write, limit.clone());
+        LimitStream {
+            read: limit_read,
+            write: limit_write,
+        }
+    }
+
+    pub fn set_limit_quota(&mut self, piece_count: u32) {
+        self.read.set_limit_quota(piece_count);
+        self.write.set_limit_quota(piece_count);
+    }
+
+    pub fn set_allow_burst(&mut self, piece_count: u32) {
+        self.read.set_allow_burst(piece_count);
+        self.write.set_allow_burst(piece_count);
+    }
+
+    pub fn with_lock_raw_stream<R>(&mut self, f: impl FnOnce(Pin<&mut S>) -> R) -> R {
+        self.read.raw_read().with_lock(f)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitStream<S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+        self.project().write.poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.project().write.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.project().write.poll_shutdown(cx)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for LimitStream<S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        self.project().read.poll_read(cx, buf)
+    }
+}
+
+#[pin_project]
+pub struct LimitRead<S: AsyncRead + Unpin + Send> {
+    #[pin]
+    read: S,
     limit: LimitRef,
     read_limiter: Option<RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware>>,
-    write_limiter: Option<RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware>>,
     read_state: ReadState,
+    limit_quota: NonZeroU32,
+    allow_burst: NonZeroU32,
+}
+
+impl<S: AsyncRead + Unpin + Send + 'static> LimitRead<S> {
+    pub fn new(read: S, limit: LimitRef) -> Self {
+        LimitRead {
+            read,
+            limit,
+            read_limiter: None,
+            read_state: ReadState::Idle,
+            limit_quota: nonzero!(10u32),
+            allow_burst: nonzero!(1u32),
+        }
+    }
+
+    pub fn set_limit_quota(&mut self, piece_count: u32) {
+        self.limit_quota = NonZeroU32::new(piece_count).unwrap_or(nonzero!(10u32));
+    }
+
+    pub fn set_allow_burst(&mut self, piece_count: u32) {
+        self.allow_burst = NonZeroU32::new(piece_count).unwrap_or(nonzero!(1u32));
+    }
+
+    pub fn raw_read_mut(&mut self) -> &mut S {
+        &mut self.read
+    }
+
+    pub fn raw_read(&self) -> &S {
+        &self.read
+    }
+
+    pub fn into_raw_read(self) -> S {
+        self.read
+    }
+}
+
+impl<S: AsyncRead + Unpin + Send + 'static> AsyncRead for LimitRead<S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.project();
+        match this.read_state {
+            ReadState::Idle => {
+                if let Some(read_limit) = this.limit.read_limit() {
+                    if this.read_limiter.is_none() {
+                        *this.read_limiter = Some(RateLimiter::direct(governor::Quota::per_second(*this.limit_quota).allow_burst(*this.allow_burst)));
+                    }
+                    let mut read_len = read_limit / this.limit_quota.get() as usize;
+                    if read_len == 0 {
+                        read_len = 1;
+                    }
+                    let mut readded_len = 0;
+
+                    let read_limiter: &'static RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware> = unsafe {
+                        std::mem::transmute(this.read_limiter.as_ref().unwrap())
+                    };
+                    let mut waiting_future = Box::pin(read_limiter.until_ready());
+                    match Pin::new(&mut waiting_future).poll(cx) {
+                        Poll::Ready(_) => {
+                            let mut read_buf = if read_len <= buf.remaining() {
+                                buf.take(read_len)
+                            } else {
+                                buf.take(buf.remaining())
+                            };
+                            match this.read.poll_read(cx, &mut read_buf) {
+                                Poll::Ready(Ok(())) => {
+                                    let len = read_buf.filled().len();
+                                    readded_len += len;
+                                    buf.advance(len);
+                                    if readded_len >= read_len {
+                                        *this.read_state = ReadState::Idle;
+                                    } else {
+                                        *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
+                                    }
+                                    Poll::Ready(Ok(()))
+                                },
+                                Poll::Ready(Err(e)) => {
+                                    *this.read_state = ReadState::Idle;
+                                    Poll::Ready(Err(e))
+                                },
+                                Poll::Pending => {
+                                    *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
+                                    Poll::Pending
+                                }
+                            }
+                        }
+                        Poll::Pending => {
+                            *this.read_state = ReadState::Waiting(Some((waiting_future, read_len, readded_len)));
+                            Poll::Pending
+                        }
+                    }
+                } else {
+                    match this.read.poll_read(cx, buf) {
+                        Poll::Ready(Ok(())) => {
+                            *this.read_state = ReadState::Idle;
+                            Poll::Ready(Ok(()))
+                        },
+                        Poll::Ready(Err(e)) => {
+                            *this.read_state = ReadState::Idle;
+                            Poll::Ready(Err(e))
+                        },
+                        Poll::Pending => {
+                            *this.read_state = ReadState::Reading(None);
+                            Poll::Pending
+                        }
+                    }
+                }
+            },
+            ReadState::Waiting(state) => {
+                let (mut rx, read_len, mut readded_len) = state.take().unwrap();
+                match Pin::new(&mut rx).poll(cx) {
+                    Poll::Ready(_) => {
+                        let mut read_buf = if (read_len - readded_len) <= buf.remaining() {
+                            buf.take(read_len - readded_len)
+                        } else {
+                            buf.take(buf.remaining())
+                        };
+                        match this.read.poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let len = read_buf.filled().len();
+                                readded_len += len;
+                                buf.advance(len);
+                                if readded_len >= read_len {
+                                    *this.read_state = ReadState::Idle;
+                                } else {
+                                    *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
+                                }
+                                Poll::Ready(Ok(()))
+                            }
+                            Poll::Ready(Err(e)) => {
+                                *this.read_state = ReadState::Idle;
+                                Poll::Ready(Err(e))
+                            },
+                            Poll::Pending => {
+                                *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
+                                Poll::Pending
+                            }
+                        }
+                    }
+                    Poll::Pending => {
+                        *this.read_state = ReadState::Waiting(Some((rx, read_len, readded_len)));
+                        Poll::Pending
+                    }
+                }
+            },
+            ReadState::Reading(state) => {
+                match state.take() {
+                    Some((read_len, mut readded_len)) => {
+                        let mut read_buf = if (read_len - readded_len) <= buf.remaining() {
+                            buf.take(read_len - readded_len)
+                        } else {
+                            buf.take(buf.remaining())
+                        };
+                        match this.read.poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let len = read_buf.filled().len();
+                                readded_len += len;
+                                buf.advance(len);
+                                if readded_len >= read_len {
+                                    *this.read_state = ReadState::Idle;
+                                } else {
+                                    *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
+                                }
+                                Poll::Ready(Ok(()))
+                            }
+                            Poll::Ready(Err(e)) => {
+                                *this.read_state = ReadState::Idle;
+                                Poll::Ready(Err(e))
+                            },
+                            Poll::Pending => {
+                                *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
+                                Poll::Pending
+                            }
+                        }
+                    },
+                    None => {
+                        match this.read.poll_read(cx, buf) {
+                            Poll::Ready(Ok(())) => {
+                                *this.read_state = ReadState::Idle;
+                                Poll::Ready(Ok(()))
+                            },
+                            Poll::Ready(Err(e)) => {
+                                *this.read_state = ReadState::Idle;
+                                Poll::Ready(Err(e))
+                            },
+                            Poll::Pending => {
+                                *this.read_state = ReadState::Reading(None);
+                                Poll::Pending
+                            }
+                        }
+                    }
+                }
+
+            }
+        }
+    }
+}
+
+#[pin_project]
+pub struct LimitWrite<S: AsyncWrite + Unpin + Send> {
+    #[pin]
+    write: S,
+    limit: LimitRef,
+    write_limiter: Option<RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware>>,
     write_state: WriteState,
     limit_quota: NonZeroU32,
     allow_burst: NonZeroU32,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> LimitStream<S> {
-    pub fn new(stream: S, limit: LimitRef) -> Self {
-        LimitStream {
-            stream,
+impl<S: AsyncWrite + Unpin + Send + 'static> LimitWrite<S> {
+    pub fn new(write: S, limit: LimitRef) -> Self {
+        LimitWrite {
+            write,
             limit,
-            read_limiter: None,
             write_limiter: None,
-            read_state: ReadState::Idle,
             write_state: WriteState::Idle,
             limit_quota: nonzero!(10u32),
             allow_burst: nonzero!(1u32),
@@ -62,185 +319,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> LimitStream<S> {
         self.allow_burst = NonZeroU32::new(piece_count).unwrap_or(nonzero!(1u32));
     }
 
-    pub fn raw_stream(&mut self) -> &mut S {
-        &mut self.stream
+    pub fn raw_write_mut(&mut self) -> &mut S {
+        &mut self.write
+    }
+
+    pub fn raw_write(&self) -> &S {
+        &self.write
+    }
+
+    pub fn into_raw_write(self) -> S {
+        self.write
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for LimitStream<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        match self.read_state {
-            ReadState::Idle => {
-                if let Some(read_limit) = self.limit.read_limit() {
-                    if self.read_limiter.is_none() {
-                        self.read_limiter = Some(RateLimiter::direct(governor::Quota::per_second(self.limit_quota).allow_burst(self.allow_burst)));
-                    }
-                    let mut read_len = read_limit / self.limit_quota.get() as usize;
-                    if read_len == 0 {
-                        read_len = 1;
-                    }
-                    let mut readded_len = 0;
-
-                    let read_limiter: &'static RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware> = unsafe {
-                        std::mem::transmute(self.read_limiter.as_ref().unwrap())
-                    };
-                    let mut waiting_future = Box::pin(read_limiter.until_ready());
-                    match Pin::new(&mut waiting_future).poll(cx) {
-                        Poll::Ready(_) => {
-                            let mut read_buf = if read_len <= buf.remaining() {
-                                buf.take(read_len)
-                            } else {
-                                buf.take(buf.remaining())
-                            };
-                            match Pin::new(&mut self.stream).poll_read(cx, &mut read_buf) {
-                                Poll::Ready(Ok(())) => {
-                                    let len = read_buf.filled().len();
-                                    readded_len += len;
-                                    buf.advance(len);
-                                    if readded_len >= read_len {
-                                        self.read_state = ReadState::Idle;
-                                    } else {
-                                        self.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                    }
-                                    Poll::Ready(Ok(()))
-                                },
-                                Poll::Ready(Err(e)) => {
-                                    self.read_state = ReadState::Idle;
-                                    Poll::Ready(Err(e))
-                                },
-                                Poll::Pending => {
-                                    self.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                    Poll::Pending
-                                }
-                            }
-                        }
-                        Poll::Pending => {
-                            self.read_state = ReadState::Waiting(Some((waiting_future, read_len, readded_len)));
-                            Poll::Pending
-                        }
-                    }
-                } else {
-                    match Pin::new(&mut self.stream).poll_read(cx, buf) {
-                        Poll::Ready(Ok(())) => {
-                            self.read_state = ReadState::Idle;
-                            Poll::Ready(Ok(()))
-                        },
-                        Poll::Ready(Err(e)) => {
-                            self.read_state = ReadState::Idle;
-                            Poll::Ready(Err(e))
-                        },
-                        Poll::Pending => {
-                            self.read_state = ReadState::Reading(None);
-                            Poll::Pending
-                        }
-                    }
-                }
-            },
-            ReadState::Waiting(ref mut state) => {
-                let (mut rx, read_len, mut readded_len) = state.take().unwrap();
-                match Pin::new(&mut rx).poll(cx) {
-                    Poll::Ready(_) => {
-                        let mut read_buf = if (read_len - readded_len) <= buf.remaining() {
-                            buf.take(read_len - readded_len)
-                        } else {
-                            buf.take(buf.remaining())
-                        };
-                        match Pin::new(&mut self.stream).poll_read(cx, &mut read_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let len = read_buf.filled().len();
-                                readded_len += len;
-                                buf.advance(len);
-                                if readded_len >= read_len {
-                                    self.read_state = ReadState::Idle;
-                                } else {
-                                    self.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                }
-                                Poll::Ready(Ok(()))
-                            }
-                            Poll::Ready(Err(e)) => {
-                                self.read_state = ReadState::Idle;
-                                Poll::Ready(Err(e))
-                            },
-                            Poll::Pending => {
-                                self.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                Poll::Pending
-                            }
-                        }
-                    }
-                    Poll::Pending => {
-                        self.read_state = ReadState::Waiting(Some((rx, read_len, readded_len)));
-                        Poll::Pending
-                    }
-                }
-            },
-            ReadState::Reading(ref mut state) => {
-                match state.take() {
-                    Some((read_len, mut readded_len)) => {
-                        let mut read_buf = if (read_len - readded_len) <= buf.remaining() {
-                            buf.take(read_len - readded_len)
-                        } else {
-                            buf.take(buf.remaining())
-                        };
-                        match Pin::new(&mut self.stream).poll_read(cx, &mut read_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let len = read_buf.filled().len();
-                                readded_len += len;
-                                buf.advance(len);
-                                if readded_len >= read_len {
-                                    self.read_state = ReadState::Idle;
-                                } else {
-                                    self.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                }
-                                Poll::Ready(Ok(()))
-                            }
-                            Poll::Ready(Err(e)) => {
-                                self.read_state = ReadState::Idle;
-                                Poll::Ready(Err(e))
-                            },
-                            Poll::Pending => {
-                                self.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                Poll::Pending
-                            }
-                        }
-                    },
-                    None => {
-                        match Pin::new(&mut self.stream).poll_read(cx, buf) {
-                            Poll::Ready(Ok(())) => {
-                                self.read_state = ReadState::Idle;
-                                Poll::Ready(Ok(()))
-                            },
-                            Poll::Ready(Err(e)) => {
-                                self.read_state = ReadState::Idle;
-                                Poll::Ready(Err(e))
-                            },
-                            Poll::Pending => {
-                                self.read_state = ReadState::Reading(None);
-                                Poll::Pending
-                            }
-                        }
-                    }
-                }
-
-            }
-        }
-    }
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitStream<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
-        match self.write_state {
+impl<S: AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitWrite<S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+        let this = self.project();
+        match this.write_state {
             WriteState::Idle => {
-                if let Some(limit) = self.limit.write_limit() {
-                    if self.write_limiter.is_none() {
-                        self.write_limiter = Some(RateLimiter::direct(governor::Quota::per_second(self.limit_quota).allow_burst(self.allow_burst)));
+                if let Some(limit) = this.limit.write_limit() {
+                    if this.write_limiter.is_none() {
+                        *this.write_limiter = Some(RateLimiter::direct(governor::Quota::per_second(*this.limit_quota).allow_burst(*this.allow_burst)));
                     }
-                    let mut write_len = limit / self.limit_quota.get() as usize;
+                    let mut write_len = limit / this.limit_quota.get() as usize;
                     if write_len == 0 {
                         write_len = 1;
                     }
                     let mut written_len = 0;
                     let write_limiter: &'static RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware> = unsafe {
-                        std::mem::transmute(self.write_limiter.as_ref().unwrap())
+                        std::mem::transmute(this.write_limiter.as_ref().unwrap())
                     };
                     let mut waiting_future = Box::pin(write_limiter.until_ready());
                     match Pin::new(&mut waiting_future).poll(cx) {
@@ -250,50 +357,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitStr
                             } else {
                                 buf
                             };
-                            match Pin::new(&mut self.stream).poll_write(cx, write_buf) {
+                            match this.write.poll_write(cx, write_buf) {
                                 Poll::Ready(Ok(len)) => {
                                     written_len += len;
                                     if written_len >= write_len {
-                                        self.write_state = WriteState::Idle;
+                                        *this.write_state = WriteState::Idle;
                                     } else {
-                                        self.write_state = WriteState::Writing(Some((write_len, written_len)));
+                                        *this.write_state = WriteState::Writing(Some((write_len, written_len)));
                                     }
                                     Poll::Ready(Ok(written_len))
                                 },
                                 Poll::Ready(Err(e)) => {
-                                    self.read_state = ReadState::Idle;
+                                    *this.write_state = WriteState::Idle;
                                     Poll::Ready(Err(e))
                                 },
                                 Poll::Pending => {
-                                    self.write_state = WriteState::Writing(Some((write_len, written_len)));
+                                    *this.write_state = WriteState::Writing(Some((write_len, written_len)));
                                     Poll::Pending
                                 }
                             }
                         },
                         Poll::Pending => {
-                            self.write_state = WriteState::Waiting(Some((waiting_future, write_len, written_len)));
+                            *this.write_state = WriteState::Waiting(Some((waiting_future, write_len, written_len)));
                             Poll::Pending
                         }
                     }
 
                 } else {
-                    match Pin::new(&mut self.stream).poll_write(cx, buf) {
+                    match this.write.poll_write(cx, buf) {
                         Poll::Ready(Ok(len)) => {
-                            self.write_state = WriteState::Idle;
+                            *this.write_state = WriteState::Idle;
                             Poll::Ready(Ok(len))
                         },
                         Poll::Ready(Err(e)) => {
-                            self.write_state = WriteState::Idle;
+                            *this.write_state = WriteState::Idle;
                             Poll::Ready(Err(e))
                         },
                         Poll::Pending => {
-                            self.write_state = WriteState::Writing(None);
+                            *this.write_state = WriteState::Writing(None);
                             Poll::Pending
                         }
                     }
                 }
             }
-            WriteState::Waiting(ref mut state) => {
+            WriteState::Waiting(state) => {
                 let (mut waiting_future, write_len, mut written_len) = state.take().unwrap();
                 match Pin::new(&mut waiting_future).poll(cx) {
                     Poll::Ready(_) => {
@@ -302,33 +409,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitStr
                         } else {
                             buf
                         };
-                        match Pin::new(&mut self.stream).poll_write(cx, write_buf) {
+                        match this.write.poll_write(cx, write_buf) {
                             Poll::Ready(Ok(len)) => {
                                 written_len += len;
                                 if written_len >= write_len {
-                                    self.write_state = WriteState::Idle;
+                                    *this.write_state = WriteState::Idle;
                                 } else {
-                                    self.write_state = WriteState::Writing(Some((write_len, written_len)));
+                                    *this.write_state = WriteState::Writing(Some((write_len, written_len)));
                                 }
                                 Poll::Ready(Ok(len))
                             },
                             Poll::Ready(Err(e)) => {
-                                self.write_state = WriteState::Idle;
+                                *this.write_state = WriteState::Idle;
                                 Poll::Ready(Err(e))
                             },
                             Poll::Pending => {
-                                self.write_state = WriteState::Writing(Some((write_len, written_len)));
+                                *this.write_state = WriteState::Writing(Some((write_len, written_len)));
                                 Poll::Pending
                             }
                         }
                     }
                     Poll::Pending => {
-                        self.write_state = WriteState::Waiting(Some((waiting_future, write_len, written_len)));
+                        *this.write_state = WriteState::Waiting(Some((waiting_future, write_len, written_len)));
                         Poll::Pending
                     }
                 }
             }
-            WriteState::Writing(ref mut state) => {
+            WriteState::Writing(state) => {
                 match state.take() {
                     Some((write_len, mut written_len)) => {
                         let write_buf = if write_len - written_len <= buf.len() {
@@ -336,38 +443,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitStr
                         } else {
                             buf
                         };
-                        match Pin::new(&mut self.stream).poll_write(cx, write_buf) {
+                        match this.write.poll_write(cx, write_buf) {
                             Poll::Ready(Ok(len)) => {
                                 written_len += len;
                                 if written_len >= write_len {
-                                    self.write_state = WriteState::Idle;
+                                    *this.write_state = WriteState::Idle;
                                 } else {
-                                    self.write_state = WriteState::Writing(Some((write_len, written_len)));
+                                    *this.write_state = WriteState::Writing(Some((write_len, written_len)));
                                 }
                                 Poll::Ready(Ok(len))
                             },
                             Poll::Ready(Err(e)) => {
-                                self.write_state = WriteState::Idle;
+                                *this.write_state = WriteState::Idle;
                                 Poll::Ready(Err(e))
                             },
                             Poll::Pending => {
-                                self.write_state = WriteState::Writing(Some((write_len, written_len)));
+                                *this.write_state = WriteState::Writing(Some((write_len, written_len)));
                                 Poll::Pending
                             }
                         }
                     },
                     None => {
-                        match Pin::new(&mut self.stream).poll_write(cx, buf) {
+                        match this.write.poll_write(cx, buf) {
                             Poll::Ready(Ok(len)) => {
-                                self.write_state = WriteState::Idle;
+                                *this.write_state = WriteState::Idle;
                                 Poll::Ready(Ok(len))
                             },
                             Poll::Ready(Err(e)) => {
-                                self.write_state = WriteState::Idle;
+                                *this.write_state = WriteState::Idle;
                                 Poll::Ready(Err(e))
                             },
                             Poll::Pending => {
-                                self.write_state = WriteState::Writing(None);
+                                *this.write_state = WriteState::Writing(None);
                                 Poll::Pending
                             }
                         }
@@ -377,12 +484,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitStr
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.project().write.poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.project().write.poll_shutdown(cx)
     }
 }
 
@@ -531,11 +638,11 @@ mod tests {
         let mut limit_stream = LimitStream::new(mock_stream, limit.clone());
         limit_stream.set_allow_burst(2);
 
-        assert_eq!(limit_stream.limit.read_limit(), Some(100));
-        assert_eq!(limit_stream.limit.write_limit(), Some(100));
-        assert!(limit_stream.read_limiter.is_none());
-        assert!(limit_stream.write_limiter.is_none());
-        assert_eq!(limit_stream.allow_burst.get(), 2u32);
+        assert_eq!(limit_stream.read.limit.read_limit(), Some(100));
+        assert_eq!(limit_stream.read.limit.write_limit(), Some(100));
+        assert!(limit_stream.read.read_limiter.is_none());
+        assert!(limit_stream.write.write_limiter.is_none());
+        assert_eq!(limit_stream.write.allow_burst.get(), 2u32);
     }
 
     #[tokio::test]
@@ -569,7 +676,9 @@ mod tests {
         // 测试无限制读取
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_pending());
-        limit_stream.raw_stream().read_should_pending = false;
+        limit_stream.with_lock_raw_stream(|stream| {
+            stream.get_mut().read_should_pending = false;
+        });
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_ready());
         assert_eq!(read_buf.filled(), &[1, 2, 3]);
@@ -593,9 +702,12 @@ mod tests {
         // 测试无限制读取
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_pending());
-        limit_stream.raw_stream().read_should_pending = false;
-        let error = Error::new(ErrorKind::Other, "read error");
-        limit_stream.raw_stream().read_error = Some(error);
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            stream.read_should_pending = false;
+            let error = Error::new(ErrorKind::Other, "read error");
+            stream.read_error = Some(error);
+        });
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_ready());
 
@@ -784,15 +896,21 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_pending());
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        limit_stream.raw_stream().read_should_pending = true;
+        limit_stream.with_lock_raw_stream(|stream| {
+            stream.get_mut().read_should_pending = true;
+        });
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_pending());
-        limit_stream.raw_stream().read_should_pending = false;
+        limit_stream.with_lock_raw_stream(|stream| {
+            stream.get_mut().read_should_pending = false;
+        });
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_ready());
         assert_eq!(read_buf.filled(), &[3]);
-        let error = Error::new(ErrorKind::Other, "read error");
-        limit_stream.raw_stream().read_error = Some(error);
+        limit_stream.with_lock_raw_stream(|stream| {
+            let error = Error::new(ErrorKind::Other, "read error");
+            stream.get_mut().read_error = Some(error);
+        });
         let mut read_buf = ReadBuf::new(&mut buffer);
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_ready());
@@ -822,8 +940,10 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_pending());
         tokio::time::sleep(Duration::from_millis(600)).await;
-        let error = Error::new(ErrorKind::Other, "read error");
-        limit_stream.raw_stream().read_error = Some(error);
+        limit_stream.with_lock_raw_stream(|stream| {
+            let error = Error::new(ErrorKind::Other, "read error");
+            stream.get_mut().read_error = Some(error);
+        });
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_ready());
 
@@ -887,7 +1007,9 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_pending());
 
-        limit_stream.raw_stream().write_should_pending = false;
+        limit_stream.with_lock_raw_stream(|stream| {
+            stream.get_mut().write_should_pending = false;
+        });
 
         // 测试无限制写入
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
@@ -911,9 +1033,12 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_pending());
 
-        limit_stream.raw_stream().write_should_pending = false;
-        let ererror = Error::new(ErrorKind::Other, "write error");
-        limit_stream.raw_stream().write_error = Some(ererror);
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            stream.write_should_pending = false;
+            let ererror = Error::new(ErrorKind::Other, "write error");
+            stream.write_error = Some(ererror);
+        });
 
         // 测试无限制写入
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
@@ -979,7 +1104,9 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         // 由于使用了实际的RateLimiter，可能返回Pending或Ready
         assert!(result.is_pending());
-        limit_stream.raw_stream().write_should_pending = false;
+        limit_stream.with_lock_raw_stream(|stream| {
+            stream.get_mut().write_should_pending = false;
+        });
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_ready());
@@ -989,16 +1116,22 @@ mod tests {
         }
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        limit_stream.raw_stream().write_should_pending = true;
+        limit_stream.with_lock_raw_stream(|stream| {
+            stream.get_mut().write_should_pending = true;
+        });
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_pending());
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_pending());
-        limit_stream.raw_stream().write_should_pending = false;
-        let error = Error::new(ErrorKind::Other, "write error");
-        limit_stream.raw_stream().write_error = Some(error);
+
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            stream.write_should_pending = false;
+            let ererror = Error::new(ErrorKind::Other, "write error");
+            stream.write_error = Some(ererror);
+        });
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_ready());
@@ -1021,7 +1154,10 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         // 由于使用了实际的RateLimiter，可能返回Pending或Ready
         assert!(result.is_pending());
-        limit_stream.raw_stream().write_should_pending = false;
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            stream.write_should_pending = false;
+        });
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_ready());
@@ -1065,7 +1201,10 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         // 由于使用了实际的RateLimiter，可能返回Pending或Ready
         assert!(result.is_pending());
-        limit_stream.raw_stream().write_should_pending = false;
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            stream.write_should_pending = false;
+        });
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
@@ -1111,13 +1250,19 @@ mod tests {
         assert!(result.is_pending());
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        limit_stream.raw_stream().write_should_pending = true;
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            stream.write_should_pending = true;
+        });
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_pending());
 
-        limit_stream.raw_stream().write_should_pending = false;
-        let error = Error::new(ErrorKind::Other, "write error");
-        limit_stream.raw_stream().write_error = Some(error);
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            stream.write_should_pending = false;
+            let ererror = Error::new(ErrorKind::Other, "write error");
+            stream.write_error = Some(ererror);
+        });
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_ready());
         if let Poll::Ready(ret) = result {
@@ -1155,8 +1300,12 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
-        let error = Error::new(ErrorKind::Other, "write error");
-        limit_stream.raw_stream().write_error = Some(error);
+        limit_stream.with_lock_raw_stream(|stream| {
+            let stream = stream.get_mut();
+            let ererror = Error::new(ErrorKind::Other, "write error");
+            stream.write_error = Some(ererror);
+        });
+
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
         assert!(result.is_ready());
         if let Poll::Ready(ret) = result {

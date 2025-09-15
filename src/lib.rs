@@ -8,9 +8,11 @@ mod qa_process;
 pub mod error;
 mod stat_stream;
 mod limit_stream;
+mod limit_datagram;
 
 pub use blocking::*;
 pub use simple_async_io::*;
 pub use qa_process::*;
 pub use limit_stream::*;
 pub use stat_stream::*;
+pub use limit_datagram::*;

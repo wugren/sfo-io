@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 use nonzero_ext::nonzero;
+use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub trait SpeedStat: 'static + Send + Sync {
@@ -207,12 +208,14 @@ impl<T: TimePicker> SpeedStat for SfoSpeedStat<T> {
     }
 }
 
-pub struct StatStream<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
+#[pin_project]
+pub struct StatStream<T: AsyncRead + AsyncWrite + Send + 'static> {
+    #[pin]
     stream: T,
     stat: Arc<dyn SpeedTracker>,
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
+impl<T: AsyncRead + AsyncWrite + Send + 'static> StatStream<T> {
     pub fn new(stream: T) -> StatStream<T> {
         StatStream {
             stream,
@@ -228,7 +231,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
+impl<T: AsyncRead + AsyncWrite + Send + 'static> StatStream<T> {
     pub(crate) fn new_test<S: TimePicker>(stream: T) -> StatStream<T> {
         StatStream {
             stream,
@@ -247,14 +250,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> StatStream<T> {
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for StatStream<T> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match Pin::new(&mut self.stream).poll_read(cx, buf) {
+        let this = self.project();
+        match this.stream.poll_read(cx, buf) {
             Poll::Ready(res) => {
                 if res.is_ok() {
-                    self.stat.add_read_data_size(buf.filled().len() as u64);
+                    this.stat.add_read_data_size(buf.filled().len() as u64);
                 }
                 Poll::Ready(res)
             },
@@ -265,14 +269,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for StatStrea
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatStream<T> {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        match Pin::new(&mut self.stream).poll_write(cx, buf) {
+        let this = self.project();
+        match this.stream.poll_write(cx, buf) {
             Poll::Ready(res) => {
                 if res.is_ok() {
-                    self.stat.add_write_data_size(buf.len() as u64);
+                    this.stat.add_write_data_size(buf.len() as u64);
                 }
                 Poll::Ready(res)
             },
@@ -281,14 +286,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatStre
     }
 
     fn poll_flush(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
+        self.project().stream.poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.project().stream.poll_shutdown(cx)
     }
 }
 #[cfg(test)]
