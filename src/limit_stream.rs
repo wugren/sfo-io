@@ -131,6 +131,7 @@ impl<S: AsyncRead + Unpin + Send + 'static> LimitRead<S> {
 impl<S: AsyncRead + Unpin + Send + 'static> AsyncRead for LimitRead<S> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.project();
+        buf.initialize_unfilled();
         match this.read_state {
             ReadState::Idle => {
                 if let Some(read_limit) = this.limit.read_limit() {
