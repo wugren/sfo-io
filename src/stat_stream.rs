@@ -322,11 +322,6 @@ mod tests {
             MOCK_TIME.store(time_ms, Ordering::Relaxed);
         }
 
-        // Helper function to advance mock time
-        fn advance_mock_time(delta_ms: u64) {
-            MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
-        }
-
         set_mock_time(1000);
         let state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
 
@@ -351,11 +346,6 @@ mod tests {
         // Helper function to set mock time
         fn set_mock_time(time_ms: u64) {
             MOCK_TIME.store(time_ms, Ordering::Relaxed);
-        }
-
-        // Helper function to advance mock time
-        fn advance_mock_time(delta_ms: u64) {
-            MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
         }
 
         set_mock_time(1500);
@@ -505,11 +495,6 @@ mod tests {
             MOCK_TIME.store(time_ms, Ordering::Relaxed);
         }
 
-        // Helper function to advance mock time
-        fn advance_mock_time(delta_ms: u64) {
-            MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
-        }
-
         let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
 
         // 添加几个不同时间的数据项
@@ -583,16 +568,6 @@ mod tests {
             }
         }
 
-        // Helper function to set mock time
-        fn set_mock_time(time_ms: u64) {
-            MOCK_TIME.store(time_ms, Ordering::Relaxed);
-        }
-
-        // Helper function to advance mock time
-        fn advance_mock_time(delta_ms: u64) {
-            MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
-        }
-
         let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(10u64));
         state.add_data(100);
         state.add_data(200);
@@ -615,11 +590,6 @@ mod tests {
         // Helper function to set mock time
         fn set_mock_time(time_ms: u64) {
             MOCK_TIME.store(time_ms, Ordering::Relaxed);
-        }
-
-        // Helper function to advance mock time
-        fn advance_mock_time(delta_ms: u64) {
-            MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
         }
 
         let stat: SfoSpeedStat<MockTimePicker> = SfoSpeedStat::new_with_time_picker();
@@ -655,11 +625,6 @@ mod tests {
             fn now() -> u128 {
                 MOCK_TIME.load(Ordering::Relaxed) as u128
             }
-        }
-
-        // Helper function to set mock time
-        fn set_mock_time(time_ms: u64) {
-            MOCK_TIME.store(time_ms, Ordering::Relaxed);
         }
 
         // Helper function to advance mock time

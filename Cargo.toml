@@ -1,6 +1,6 @@
 [package]
 name = "sfo-io"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 repository = "https://github.com/wugren/sfo-io.git"
 license-file = "LICENSE"
@@ -16,14 +16,7 @@ nonzero_ext = "0.3"
 futures = "0.3"
 pin-project = "1.1"
 sfo-split = { version = "0.1", features = ["io"] }
+async-recursion = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
-
-[[test]]
-name = "stat_stream"
-path = "src/stat_stream.rs"
-
-[[test]]
-name = "limit_stream"
-path = "src/limit_stream.rs"

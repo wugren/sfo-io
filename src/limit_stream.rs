@@ -1,32 +1,21 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+use crate::SpeedLimitSession;
 use std::io::Error;
-use std::num::NonZeroU32;
 use std::pin::{Pin};
-use std::sync::Arc;
 use std::task::{Context, Poll};
-use governor::{clock, RateLimiter};
-use governor::middleware::NoOpMiddleware;
-use governor::state::{InMemoryState, NotKeyed};
-use nonzero_ext::nonzero;
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub trait Limit: 'static + Sync + Send {
-    fn read_limit(&self) -> Option<usize>;
-    fn write_limit(&self) -> Option<usize>;
-}
-pub type LimitRef = Arc<dyn Limit>;
-
 enum ReadState {
     Idle,
-    Waiting(Option<(Pin<Box<dyn Future<Output=()> + Send + Sync + 'static>>, usize, usize)>),
+    Waiting(Option<(Pin<Box<dyn Future<Output=usize> + Send + 'static>>, usize)>),
     Reading(Option<(usize, usize)>),
 }
 
 enum WriteState {
     Idle,
-    Waiting(Option<(Pin<Box<dyn Future<Output=()> + Send + Sync + 'static>>, usize, usize)>),
+    Waiting(Option<(Pin<Box<dyn Future<Output=usize> + Send + 'static>>, usize)>),
     Writing(Option<(usize, usize)>),
 }
 
@@ -39,26 +28,15 @@ pub struct LimitStream<S: AsyncRead + AsyncWrite + Unpin + Send> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> LimitStream<S> {
-    pub fn new(stream: S, limit: LimitRef) -> Self {
+    pub fn new(stream: S, read_limit: SpeedLimitSession, write_limit: SpeedLimitSession) -> Self {
         let (read, write) = sfo_split::split(stream);
-        let limit_read = LimitRead::new(read, limit.clone());
-        let limit_write = LimitWrite::new(write, limit.clone());
+        let limit_read = LimitRead::new(read, read_limit);
+        let limit_write = LimitWrite::new(write, write_limit);
         LimitStream {
             read: limit_read,
             write: limit_write,
         }
     }
-
-    pub fn set_limit_quota(&mut self, piece_count: u32) {
-        self.read.set_limit_quota(piece_count);
-        self.write.set_limit_quota(piece_count);
-    }
-
-    pub fn set_allow_burst(&mut self, piece_count: u32) {
-        self.read.set_allow_burst(piece_count);
-        self.write.set_allow_burst(piece_count);
-    }
-
     pub fn with_lock_raw_stream<R>(&mut self, f: impl FnOnce(Pin<&mut S>) -> R) -> R {
         self.read.raw_read().with_lock(f)
     }
@@ -88,31 +66,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for LimitStre
 pub struct LimitRead<S: AsyncRead + Unpin + Send> {
     #[pin]
     read: S,
-    limit: LimitRef,
-    read_limiter: Option<RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware>>,
+    read_limit: SpeedLimitSession,
     read_state: ReadState,
-    limit_quota: NonZeroU32,
-    allow_burst: NonZeroU32,
 }
 
 impl<S: AsyncRead + Unpin + Send + 'static> LimitRead<S> {
-    pub fn new(read: S, limit: LimitRef) -> Self {
+    pub fn new(read: S, read_limit: SpeedLimitSession) -> Self {
         LimitRead {
             read,
-            limit,
-            read_limiter: None,
+            read_limit,
             read_state: ReadState::Idle,
-            limit_quota: nonzero!(10u32),
-            allow_burst: nonzero!(1u32),
         }
-    }
-
-    pub fn set_limit_quota(&mut self, piece_count: u32) {
-        self.limit_quota = NonZeroU32::new(piece_count).unwrap_or(nonzero!(10u32));
-    }
-
-    pub fn set_allow_burst(&mut self, piece_count: u32) {
-        self.allow_burst = NonZeroU32::new(piece_count).unwrap_or(nonzero!(1u32));
     }
 
     pub fn raw_read_mut(&mut self) -> &mut S {
@@ -130,79 +94,55 @@ impl<S: AsyncRead + Unpin + Send + 'static> LimitRead<S> {
 
 impl<S: AsyncRead + Unpin + Send + 'static> AsyncRead for LimitRead<S> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.project();
+        let mut this = self.project();
         buf.initialize_unfilled();
         match this.read_state {
             ReadState::Idle => {
-                if let Some(read_limit) = this.limit.read_limit() {
-                    if this.read_limiter.is_none() {
-                        *this.read_limiter = Some(RateLimiter::direct(governor::Quota::per_second(*this.limit_quota).allow_burst(*this.allow_burst)));
-                    }
-                    let mut read_len = read_limit / this.limit_quota.get() as usize;
-                    if read_len == 0 {
-                        read_len = 1;
-                    }
-                    let mut readded_len = 0;
+                let mut readded_len = 0;
 
-                    let read_limiter: &'static RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware> = unsafe {
-                        std::mem::transmute(this.read_limiter.as_ref().unwrap())
-                    };
-                    let mut waiting_future = Box::pin(read_limiter.until_ready());
-                    match Pin::new(&mut waiting_future).poll(cx) {
-                        Poll::Ready(_) => {
-                            let mut read_buf = if read_len <= buf.remaining() {
-                                buf.take(read_len)
-                            } else {
-                                buf.take(buf.remaining())
-                            };
-                            match this.read.poll_read(cx, &mut read_buf) {
-                                Poll::Ready(Ok(())) => {
-                                    let len = read_buf.filled().len();
-                                    readded_len += len;
-                                    buf.advance(len);
-                                    if readded_len >= read_len {
-                                        *this.read_state = ReadState::Idle;
-                                    } else {
-                                        *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                    }
-                                    Poll::Ready(Ok(()))
-                                },
-                                Poll::Ready(Err(e)) => {
+                let read_limit: &'static mut SpeedLimitSession = unsafe {
+                    std::mem::transmute(this.read_limit)
+                };
+                let mut waiting_future = Box::pin(read_limit.until_ready());
+                match Pin::new(&mut waiting_future).poll(cx) {
+                    Poll::Ready(read_len) => {
+                        let mut read_buf = if read_len <= buf.remaining() {
+                            buf.take(read_len)
+                        } else {
+                            buf.take(buf.remaining())
+                        };
+                        match this.read.poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let len = read_buf.filled().len();
+                                readded_len += len;
+                                buf.advance(len);
+                                if readded_len >= read_len {
                                     *this.read_state = ReadState::Idle;
-                                    Poll::Ready(Err(e))
-                                },
-                                Poll::Pending => {
+                                } else {
                                     *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
-                                    Poll::Pending
                                 }
+                                Poll::Ready(Ok(()))
+                            },
+                            Poll::Ready(Err(e)) => {
+                                *this.read_state = ReadState::Idle;
+                                Poll::Ready(Err(e))
+                            },
+                            Poll::Pending => {
+                                *this.read_state = ReadState::Reading(Some((read_len, readded_len)));
+                                Poll::Pending
                             }
                         }
-                        Poll::Pending => {
-                            *this.read_state = ReadState::Waiting(Some((waiting_future, read_len, readded_len)));
-                            Poll::Pending
-                        }
                     }
-                } else {
-                    match this.read.poll_read(cx, buf) {
-                        Poll::Ready(Ok(())) => {
-                            *this.read_state = ReadState::Idle;
-                            Poll::Ready(Ok(()))
-                        },
-                        Poll::Ready(Err(e)) => {
-                            *this.read_state = ReadState::Idle;
-                            Poll::Ready(Err(e))
-                        },
-                        Poll::Pending => {
-                            *this.read_state = ReadState::Reading(None);
-                            Poll::Pending
-                        }
+                    Poll::Pending => {
+                        *this.read_state = ReadState::Waiting(Some((waiting_future, readded_len)));
+                        Poll::Pending
                     }
                 }
-            },
+            }
             ReadState::Waiting(state) => {
-                let (mut rx, read_len, mut readded_len) = state.take().unwrap();
+                let (mut rx, mut readded_len) = state.take().unwrap();
                 match Pin::new(&mut rx).poll(cx) {
-                    Poll::Ready(_) => {
+                    Poll::Ready(read_len) => {
                         let mut read_buf = if (read_len - readded_len) <= buf.remaining() {
                             buf.take(read_len - readded_len)
                         } else {
@@ -231,7 +171,7 @@ impl<S: AsyncRead + Unpin + Send + 'static> AsyncRead for LimitRead<S> {
                         }
                     }
                     Poll::Pending => {
-                        *this.read_state = ReadState::Waiting(Some((rx, read_len, readded_len)));
+                        *this.read_state = ReadState::Waiting(Some((rx, readded_len)));
                         Poll::Pending
                     }
                 }
@@ -293,33 +233,18 @@ impl<S: AsyncRead + Unpin + Send + 'static> AsyncRead for LimitRead<S> {
 pub struct LimitWrite<S: AsyncWrite + Unpin + Send> {
     #[pin]
     write: S,
-    limit: LimitRef,
-    write_limiter: Option<RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware>>,
+    write_limit: SpeedLimitSession,
     write_state: WriteState,
-    limit_quota: NonZeroU32,
-    allow_burst: NonZeroU32,
 }
 
 impl<S: AsyncWrite + Unpin + Send + 'static> LimitWrite<S> {
-    pub fn new(write: S, limit: LimitRef) -> Self {
+    pub fn new(write: S, write_limit: SpeedLimitSession) -> Self {
         LimitWrite {
             write,
-            limit,
-            write_limiter: None,
+            write_limit,
             write_state: WriteState::Idle,
-            limit_quota: nonzero!(10u32),
-            allow_burst: nonzero!(1u32),
         }
     }
-
-    pub fn set_limit_quota(&mut self, piece_count: u32) {
-        self.limit_quota = NonZeroU32::new(piece_count).unwrap_or(nonzero!(10u32));
-    }
-
-    pub fn set_allow_burst(&mut self, piece_count: u32) {
-        self.allow_burst = NonZeroU32::new(piece_count).unwrap_or(nonzero!(1u32));
-    }
-
     pub fn raw_write_mut(&mut self) -> &mut S {
         &mut self.write
     }
@@ -335,76 +260,51 @@ impl<S: AsyncWrite + Unpin + Send + 'static> LimitWrite<S> {
 
 impl<S: AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitWrite<S> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
-        let this = self.project();
+        let mut this = self.project();
         match this.write_state {
             WriteState::Idle => {
-                if let Some(limit) = this.limit.write_limit() {
-                    if this.write_limiter.is_none() {
-                        *this.write_limiter = Some(RateLimiter::direct(governor::Quota::per_second(*this.limit_quota).allow_burst(*this.allow_burst)));
-                    }
-                    let mut write_len = limit / this.limit_quota.get() as usize;
-                    if write_len == 0 {
-                        write_len = 1;
-                    }
-                    let mut written_len = 0;
-                    let write_limiter: &'static RateLimiter<NotKeyed, InMemoryState, clock::DefaultClock, NoOpMiddleware> = unsafe {
-                        std::mem::transmute(this.write_limiter.as_ref().unwrap())
-                    };
-                    let mut waiting_future = Box::pin(write_limiter.until_ready());
-                    match Pin::new(&mut waiting_future).poll(cx) {
-                        Poll::Ready(_) => {
-                            let write_buf = if write_len <= buf.len() {
-                                &buf[..write_len]
-                            } else {
-                                buf
-                            };
-                            match this.write.poll_write(cx, write_buf) {
-                                Poll::Ready(Ok(len)) => {
-                                    written_len += len;
-                                    if written_len >= write_len {
-                                        *this.write_state = WriteState::Idle;
-                                    } else {
-                                        *this.write_state = WriteState::Writing(Some((write_len, written_len)));
-                                    }
-                                    Poll::Ready(Ok(written_len))
-                                },
-                                Poll::Ready(Err(e)) => {
+                let mut written_len = 0;
+                let write_limiter: &'static mut SpeedLimitSession = unsafe {
+                    std::mem::transmute(this.write_limit)
+                };
+                let mut waiting_future = Box::pin(write_limiter.until_ready());
+                match Pin::new(&mut waiting_future).poll(cx) {
+                    Poll::Ready(write_len) => {
+                        let write_buf = if write_len <= buf.len() {
+                            &buf[..write_len]
+                        } else {
+                            buf
+                        };
+                        match this.write.poll_write(cx, write_buf) {
+                            Poll::Ready(Ok(len)) => {
+                                written_len += len;
+                                if written_len >= write_len {
                                     *this.write_state = WriteState::Idle;
-                                    Poll::Ready(Err(e))
-                                },
-                                Poll::Pending => {
+                                } else {
                                     *this.write_state = WriteState::Writing(Some((write_len, written_len)));
-                                    Poll::Pending
                                 }
+                                Poll::Ready(Ok(written_len))
                             }
-                        },
-                        Poll::Pending => {
-                            *this.write_state = WriteState::Waiting(Some((waiting_future, write_len, written_len)));
-                            Poll::Pending
+                            Poll::Ready(Err(e)) => {
+                                *this.write_state = WriteState::Idle;
+                                Poll::Ready(Err(e))
+                            }
+                            Poll::Pending => {
+                                *this.write_state = WriteState::Writing(Some((write_len, written_len)));
+                                Poll::Pending
+                            }
                         }
                     }
-
-                } else {
-                    match this.write.poll_write(cx, buf) {
-                        Poll::Ready(Ok(len)) => {
-                            *this.write_state = WriteState::Idle;
-                            Poll::Ready(Ok(len))
-                        },
-                        Poll::Ready(Err(e)) => {
-                            *this.write_state = WriteState::Idle;
-                            Poll::Ready(Err(e))
-                        },
-                        Poll::Pending => {
-                            *this.write_state = WriteState::Writing(None);
-                            Poll::Pending
-                        }
+                    Poll::Pending => {
+                        *this.write_state = WriteState::Waiting(Some((waiting_future, written_len)));
+                        Poll::Pending
                     }
                 }
             }
             WriteState::Waiting(state) => {
-                let (mut waiting_future, write_len, mut written_len) = state.take().unwrap();
+                let (mut waiting_future, mut written_len) = state.take().unwrap();
                 match Pin::new(&mut waiting_future).poll(cx) {
-                    Poll::Ready(_) => {
+                    Poll::Ready(write_len) => {
                         let write_buf = if write_len - written_len <= buf.len() {
                             &buf[..(write_len - written_len)]
                         } else {
@@ -431,7 +331,7 @@ impl<S: AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitWrite<S> {
                         }
                     }
                     Poll::Pending => {
-                        *this.write_state = WriteState::Waiting(Some((waiting_future, write_len, written_len)));
+                        *this.write_state = WriteState::Waiting(Some((waiting_future, written_len)));
                         Poll::Pending
                     }
                 }
@@ -502,10 +402,10 @@ mod tests {
     use std::io::{Error, ErrorKind};
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use futures::task::noop_waker;
+    use std::num::NonZeroU32;
 
     // Mock stream implementation for testing
     struct MockStream {
@@ -610,47 +510,12 @@ mod tests {
         }
     }
 
-    // Mock limit implementation
-    struct MockLimit {
-        read_limit: Option<usize>,
-        write_limit: Option<usize>,
-    }
-
-    impl MockLimit {
-        fn new(read_limit: Option<usize>, write_limit: Option<usize>) -> Self {
-            Self { read_limit, write_limit }
-        }
-    }
-
-    impl Limit for MockLimit {
-        fn read_limit(&self) -> Option<usize> {
-            self.read_limit
-        }
-
-        fn write_limit(&self) -> Option<usize> {
-            self.write_limit
-        }
-    }
-
-    #[test]
-    fn test_new_limit_stream() {
-        let mock_stream = MockStream::new(vec![]);
-        let limit = Arc::new(MockLimit::new(Some(100), Some(100)));
-        let mut limit_stream = LimitStream::new(mock_stream, limit.clone());
-        limit_stream.set_allow_burst(2);
-
-        assert_eq!(limit_stream.read.limit.read_limit(), Some(100));
-        assert_eq!(limit_stream.read.limit.write_limit(), Some(100));
-        assert!(limit_stream.read.read_limiter.is_none());
-        assert!(limit_stream.write.write_limiter.is_none());
-        assert_eq!(limit_stream.write.allow_burst.get(), 2u32);
-    }
-
     #[tokio::test]
     async fn test_read_without_limit() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -666,8 +531,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_without_limit1() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 3];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -692,8 +558,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_without_limit2() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 3];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -721,8 +588,9 @@ mod tests {
     async fn test_read_without_limit_err() {
         let error = Error::new(ErrorKind::Other, "read error");
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_error(error);
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -741,9 +609,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(1), None)); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -776,9 +646,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit2() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(2), None)); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -811,9 +683,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit3() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(2), None)); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 1];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -850,9 +724,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit4() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(1), None)); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(2);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(2).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 1];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -865,20 +741,27 @@ mod tests {
 
         let mut read_buf = ReadBuf::new(&mut buffer);
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
+        assert!(result.is_ready());
+        assert_eq!(read_buf.filled(), &[2]);
+
+        let mut read_buf = ReadBuf::new(&mut buffer);
+        let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_pending());
         tokio::time::sleep(Duration::from_millis(600)).await;
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_ready());
-        assert_eq!(read_buf.filled(), &[2]);
+        assert_eq!(read_buf.filled(), &[3]);
 
     }
 
     #[tokio::test]
     async fn test_read_with_limit5() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(2), None)); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(2).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 1];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -924,9 +807,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit6() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(1), None)); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(2);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(2).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 1];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -936,6 +821,11 @@ mod tests {
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
         assert!(result.is_ready());
         assert_eq!(read_buf.filled(), &[1]);
+
+        let mut read_buf = ReadBuf::new(&mut buffer);
+        let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
+        assert!(result.is_ready());
+        assert_eq!(read_buf.filled(), &[2]);
 
         let mut read_buf = ReadBuf::new(&mut buffer);
         let result = Pin::new(&mut limit_stream).poll_read(&mut cx, &mut read_buf);
@@ -956,8 +846,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_without_limit() {
         let mock_stream = MockStream::new(vec![]);
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
@@ -976,8 +869,11 @@ mod tests {
     async fn test_write_without_limit2() {
         let error = Error::new(ErrorKind::Other, "write error");
         let mock_stream = MockStream::new(vec![]).with_write_error(error);
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
@@ -998,8 +894,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_without_limit3() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
@@ -1024,8 +923,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_without_limit4() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
@@ -1056,9 +958,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit() {
         let mock_stream = MockStream::new(vec![]);
-        let limit = Arc::new(MockLimit::new(None, Some(1))); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
@@ -1066,7 +970,7 @@ mod tests {
 
         // 第一次写入应该等待令牌
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
-        // 由于使用了实际的RateLimiter，可能返回Pending或Ready
+        // 由于使用了实际的SpeedLimiter，可能返回Pending或Ready
         assert!(result.is_ready());
         if let Poll::Ready(Ok(written)) = result {
             assert_eq!(written, 1);
@@ -1094,16 +998,18 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit1() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let limit = Arc::new(MockLimit::new(None, Some(1))); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
-        // 由于使用了实际的RateLimiter，可能返回Pending或Ready
+        // 由于使用了实际的SpeedLimiter，可能返回Pending或Ready
         assert!(result.is_pending());
         limit_stream.with_lock_raw_stream(|stream| {
             stream.get_mut().write_should_pending = false;
@@ -1144,16 +1050,18 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit2() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let limit = Arc::new(MockLimit::new(None, Some(2))); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1];
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
-        // 由于使用了实际的RateLimiter，可能返回Pending或Ready
+        // 由于使用了实际的SpeedLimiter，可能返回Pending或Ready
         assert!(result.is_pending());
         limit_stream.with_lock_raw_stream(|stream| {
             let stream = stream.get_mut();
@@ -1177,9 +1085,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit3() {
         let mock_stream = MockStream::new(vec![]);
-        let limit = Arc::new(MockLimit::new(None, Some(2))); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1];
         let waker = noop_waker();
@@ -1200,7 +1110,7 @@ mod tests {
         }
 
         let result = Pin::new(&mut limit_stream).poll_write(&mut cx, &data);
-        // 由于使用了实际的RateLimiter，可能返回Pending或Ready
+        // 由于使用了实际的SpeedLimiter，可能返回Pending或Ready
         assert!(result.is_pending());
         limit_stream.with_lock_raw_stream(|stream| {
             let stream = stream.get_mut();
@@ -1225,9 +1135,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit4() {
         let mock_stream = MockStream::new(vec![]);
-        let limit = Arc::new(MockLimit::new(None, Some(2))); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1];
         let waker = noop_waker();
@@ -1274,9 +1186,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit5() {
         let mock_stream = MockStream::new(vec![]);
-        let limit = Arc::new(MockLimit::new(None, Some(2))); // 100 bytes per second limit
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1];
         let waker = noop_waker();
@@ -1318,8 +1232,11 @@ mod tests {
     async fn test_read_error_propagation() {
         let error = Error::new(ErrorKind::Other, "read error");
         let mock_stream = MockStream::new(vec![]).with_read_error(error);
-        let limit = Arc::new(MockLimit::new(Some(100), None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -1338,8 +1255,11 @@ mod tests {
     async fn test_write_error_propagation() {
         let error = Error::new(ErrorKind::Other, "write error");
         let mock_stream = MockStream::new(vec![]).with_write_error(error);
-        let limit = Arc::new(MockLimit::new(None, Some(100)));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
@@ -1356,8 +1276,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_limit_pending_handling() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let limit = Arc::new(MockLimit::new(Some(1), None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -1374,9 +1297,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_limit_pending_handling2() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(1), None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
-        limit_stream.set_limit_quota(1);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 1];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -1395,8 +1320,11 @@ mod tests {
     #[tokio::test]
     async fn test_read_pending_handling() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
         let mut read_buf = ReadBuf::new(&mut buffer);
@@ -1413,8 +1341,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_pending_handling() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let data = [1, 2, 3, 4, 5];
         let waker = noop_waker();
@@ -1430,8 +1361,11 @@ mod tests {
     #[tokio::test]
     async fn test_flush_and_shutdown() {
         let mock_stream = MockStream::new(vec![]);
-        let limit = Arc::new(MockLimit::new(None, None));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -1447,8 +1381,11 @@ mod tests {
     #[tokio::test]
     async fn test_mixed_read_write() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let limit = Arc::new(MockLimit::new(Some(100), Some(100)));
-        let mut limit_stream = LimitStream::new(mock_stream, limit);
+        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let read_limit = read_limiter.new_limit_session();
+        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limit = write_limiter.new_limit_session();
+        let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
