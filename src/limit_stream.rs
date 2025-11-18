@@ -513,8 +513,8 @@ mod tests {
     #[tokio::test]
     async fn test_read_without_limit() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
-        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let read_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
@@ -531,8 +531,8 @@ mod tests {
     #[tokio::test]
     async fn test_read_without_limit1() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
-        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let read_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 3];
@@ -558,8 +558,8 @@ mod tests {
     #[tokio::test]
     async fn test_read_without_limit2() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
-        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let read_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 3];
@@ -588,8 +588,8 @@ mod tests {
     async fn test_read_without_limit_err() {
         let error = Error::new(ErrorKind::Other, "read error");
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_error(error);
-        let read_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
-        let write_limit = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap()).new_limit_session();
+        let read_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
+        let write_limit = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap())).new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
         let mut buffer = [0u8; 10];
@@ -609,9 +609,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -646,9 +646,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit2() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(2).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -683,9 +683,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit3() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(2).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -724,9 +724,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit4() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(2).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(2).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -757,9 +757,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit5() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(2).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(2).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -807,9 +807,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_with_limit6() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(2).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(2).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -846,9 +846,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_without_limit() {
         let mock_stream = MockStream::new(vec![]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -869,9 +869,9 @@ mod tests {
     async fn test_write_without_limit2() {
         let error = Error::new(ErrorKind::Other, "write error");
         let mock_stream = MockStream::new(vec![]).with_write_error(error);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -894,9 +894,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_without_limit3() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -923,9 +923,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_without_limit4() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -958,9 +958,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit() {
         let mock_stream = MockStream::new(vec![]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -998,9 +998,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit1() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1050,9 +1050,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit2() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(2).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1085,9 +1085,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit3() {
         let mock_stream = MockStream::new(vec![]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(2).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1135,9 +1135,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit4() {
         let mock_stream = MockStream::new(vec![]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(2).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1186,9 +1186,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_with_limit5() {
         let mock_stream = MockStream::new(vec![]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(2).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1232,9 +1232,9 @@ mod tests {
     async fn test_read_error_propagation() {
         let error = Error::new(ErrorKind::Other, "read error");
         let mock_stream = MockStream::new(vec![]).with_read_error(error);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1255,9 +1255,9 @@ mod tests {
     async fn test_write_error_propagation() {
         let error = Error::new(ErrorKind::Other, "write error");
         let mock_stream = MockStream::new(vec![]).with_write_error(error);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1276,9 +1276,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_limit_pending_handling() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1297,9 +1297,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_limit_pending_handling2() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1320,9 +1320,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_pending_handling() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]).with_read_pending();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1341,9 +1341,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_pending_handling() {
         let mock_stream = MockStream::new(vec![]).with_write_pending();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 
@@ -1361,9 +1361,9 @@ mod tests {
     #[tokio::test]
     async fn test_flush_and_shutdown() {
         let mock_stream = MockStream::new(vec![]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
         let waker = noop_waker();
@@ -1381,9 +1381,9 @@ mod tests {
     #[tokio::test]
     async fn test_mixed_read_write() {
         let mock_stream = MockStream::new(vec![1, 2, 3, 4, 5]);
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_stream = LimitStream::new(mock_stream, read_limit, write_limit);
 

@@ -176,9 +176,9 @@ mod tests {
     #[tokio::test]
     async fn test_limit_datagram_new() {
         let mock_datagram = MockDatagram::new();
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -197,9 +197,9 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_without_write_limit() {
         let mock_datagram = MockDatagram::new().with_send_result(Ok(10));
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -214,9 +214,9 @@ mod tests {
     #[tokio::test]
     async fn test_recv_from_without_read_limit() {
         let mock_datagram = MockDatagram::new().with_recv_result(Ok(10));
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -231,9 +231,9 @@ mod tests {
     #[tokio::test]
     async fn test_send_to_with_write_limit_initial() {
         let mock_datagram = MockDatagram::new().with_send_result(Ok(10));
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::MAX, NonZeroU32::new(1024).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::MAX), Some(NonZeroU32::new(1024).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -248,9 +248,9 @@ mod tests {
     #[tokio::test]
     async fn test_recv_from_with_read_limit_initial() {
         let mock_datagram = MockDatagram::new().with_recv_result(Ok(10));
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -268,9 +268,9 @@ mod tests {
             .with_send_result(Ok(5))
             .with_send_result(Ok(5));
 
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(10).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -314,9 +314,9 @@ mod tests {
         let mock_datagram = MockDatagram::new()
             .with_recv_result(Ok(5))
             .with_recv_result(Ok(5));
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(10).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(1).unwrap(), NonZeroU32::new(10).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(1).unwrap()), Some(NonZeroU32::new(10).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -361,9 +361,9 @@ mod tests {
         let mock_datagram = MockDatagram::new()
             .with_send_result(Ok(5))
             .with_send_result(Ok(5));
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
@@ -388,9 +388,9 @@ mod tests {
         let mock_datagram = MockDatagram::new()
             .with_recv_result(Ok(5))
             .with_recv_result(Ok(5));
-        let read_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(1).unwrap());
+        let read_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let read_limit = read_limiter.new_limit_session();
-        let write_limiter = crate::SpeedLimiter::new(None, NonZeroU32::new(10).unwrap(), NonZeroU32::new(1).unwrap());
+        let write_limiter = crate::SpeedLimiter::new(None, Some(NonZeroU32::new(10).unwrap()), Some(NonZeroU32::new(1).unwrap()));
         let write_limit = write_limiter.new_limit_session();
         let mut limit_datagram = LimitDatagram::new(mock_datagram, read_limit, write_limit);
 
