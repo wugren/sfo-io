@@ -94,7 +94,7 @@ impl<S: AsyncRead + Unpin + Send + 'static> LimitRead<S> {
 
 impl<S: AsyncRead + Unpin + Send + 'static> AsyncRead for LimitRead<S> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let mut this = self.project();
+        let this = self.project();
         buf.initialize_unfilled();
         match this.read_state {
             ReadState::Idle => {
@@ -260,7 +260,7 @@ impl<S: AsyncWrite + Unpin + Send + 'static> LimitWrite<S> {
 
 impl<S: AsyncWrite + Unpin + Send + 'static> AsyncWrite for LimitWrite<S> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
-        let mut this = self.project();
+        let this = self.project();
         match this.write_state {
             WriteState::Idle => {
                 let mut written_len = 0;

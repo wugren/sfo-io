@@ -152,7 +152,7 @@ mod tests {
         async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
             self.call_history.lock().unwrap().push("send_to".to_string());
             match self.send_returns.lock().unwrap().pop_front() {
-                Some(result) => Ok(buf.len()),
+                Some(_result) => Ok(buf.len()),
                 None => Ok(buf.len()), // 默认返回缓冲区长度
             }
         }
