@@ -9,13 +9,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 enum ReadState {
     Idle,
-    Waiting(Option<(Pin<Box<dyn Future<Output=usize> + Send + 'static>>, usize)>),
+    Waiting(Option<(Pin<Box<dyn Future<Output=usize> + Send + Sync + 'static>>, usize)>),
     Reading(Option<(usize, usize)>),
 }
 
 enum WriteState {
     Idle,
-    Waiting(Option<(Pin<Box<dyn Future<Output=usize> + Send + 'static>>, usize)>),
+    Waiting(Option<(Pin<Box<dyn Future<Output=usize> + Send + Sync + 'static>>, usize)>),
     Writing(Option<(usize, usize)>),
 }
 

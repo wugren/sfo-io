@@ -87,7 +87,7 @@ impl SpeedLimitSession {
         }
     }
 
-    #[async_recursion::async_recursion]
+    #[async_recursion::async_recursion(Sync)]
     async fn until_ready_inner(&mut self) -> usize {
         if self.upper_session.is_some() {
             if self.upper_remainder == 0 {
