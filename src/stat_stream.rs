@@ -296,6 +296,135 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatStre
         self.project().stream.poll_shutdown(cx)
     }
 }
+
+#[pin_project]
+pub struct StatRead<T: AsyncRead + Send + 'static> {
+    #[pin]
+    reader: T,
+    stat: Arc<dyn SpeedTracker>,
+}
+
+impl<T: AsyncRead + Send + 'static> StatRead<T> {
+    pub fn new(reader: T) -> StatRead<T> {
+        StatRead {
+            reader,
+            stat: Arc::new(SfoSpeedStat::new()),
+        }
+    }
+
+    pub fn new_with_tracker(reader: T, tracker: Arc<dyn SpeedTracker>) -> StatRead<T> {
+        StatRead {
+            reader,
+            stat: tracker,
+        }
+    }
+}
+
+impl<T: AsyncRead + Send + 'static> StatRead<T> {
+    pub(crate) fn new_test<S: TimePicker>(reader: T) -> StatRead<T> {
+        StatRead {
+            reader,
+            stat: Arc::new(SfoSpeedStat::<S>::new_with_time_picker()),
+        }
+    }
+
+    pub fn get_speed_stat(&self) -> Arc<dyn SpeedStat> {
+        self.stat.clone()
+    }
+
+    pub fn raw_reader(&mut self) -> &mut T {
+        &mut self.reader
+    }
+}
+
+impl<T: AsyncRead + Unpin + Send + 'static> AsyncRead for StatRead<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.project();
+        match this.reader.poll_read(cx, buf) {
+            Poll::Ready(res) => {
+                if res.is_ok() {
+                    this.stat.add_read_data_size(buf.filled().len() as u64);
+                }
+                Poll::Ready(res)
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[pin_project]
+pub struct StatWrite<T: AsyncWrite + Send + 'static> {
+    #[pin]
+    writer: T,
+    stat: Arc<dyn SpeedTracker>,
+}
+
+impl<T: AsyncWrite + Send + 'static> StatWrite<T> {
+    pub fn new(writer: T) -> StatWrite<T> {
+        StatWrite {
+            writer,
+            stat: Arc::new(SfoSpeedStat::new()),
+        }
+    }
+
+    pub fn new_with_tracker(writer: T, tracker: Arc<dyn SpeedTracker>) -> StatWrite<T> {
+        StatWrite {
+            writer,
+            stat: tracker,
+        }
+    }
+}
+
+impl<T: AsyncWrite + Send + 'static> StatWrite<T> {
+    pub(crate) fn new_test<S: TimePicker>(writer: T) -> StatWrite<T> {
+        StatWrite {
+            writer,
+            stat: Arc::new(SfoSpeedStat::<S>::new_with_time_picker()),
+        }
+    }
+
+    pub fn get_speed_stat(&self) -> Arc<dyn SpeedStat> {
+        self.stat.clone()
+    }
+
+    pub fn raw_writer(&mut self) -> &mut T {
+        &mut self.writer
+    }
+}
+
+impl<T: AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatWrite<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.project();
+        match this.writer.poll_write(cx, buf) {
+            Poll::Ready(res) => {
+                if res.is_ok() {
+                    this.stat.add_write_data_size(buf.len() as u64);
+                }
+                Poll::Ready(res)
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        self.project().writer.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        self.project().writer.poll_shutdown(cx)
+    }
+}
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -719,5 +848,150 @@ mod tests {
             }
         }
         stat_stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stat_read_creation() {
+        static MOCK_TIME: AtomicU64 = AtomicU64::new(0);
+
+        struct MockTimePicker;
+
+        impl TimePicker for MockTimePicker {
+            fn now() -> u128 {
+                MOCK_TIME.load(Ordering::Relaxed) as u128
+            }
+        }
+
+        // Helper function to advance mock time
+        fn advance_mock_time(delta_ms: u64) {
+            MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
+        }
+
+        // 创建一个简单的mock reader用于测试
+        struct MockReader {
+            future: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+        }
+
+        impl AsyncRead for MockReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if self.future.is_none() {
+                    self.future = Some(Box::pin(tokio::time::sleep(Duration::from_millis(10))));
+                }
+                match Pin::new(self.future.as_mut().unwrap()).poll(_cx) {
+                    Poll::Ready(_) => {
+                        self.future = None;
+                        _buf.set_filled(10);
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        impl Unpin for MockReader {}
+
+        let reader = MockReader{
+            future: None,
+        };
+        let mut stat_reader = StatRead::new_test::<MockTimePicker>(reader);
+        let speed_stat = stat_reader.get_speed_stat();
+        let mut download_size = 0;
+        let mut buf = vec![0u8; 4096];
+        advance_mock_time(500);
+        for i in 0..100 {
+            let size = stat_reader.read(&mut buf).await.unwrap();
+            download_size += size;
+            advance_mock_time(1000);
+            if i < 5 {
+                assert_eq!(speed_stat.get_read_speed(), (download_size / 5) as u64);
+            } else {
+                assert_eq!(speed_stat.get_read_sum_size(), download_size as u64);
+                assert_eq!(speed_stat.get_read_speed(), (10 * 5 - 5)/5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stat_write_creation() {
+        static MOCK_TIME: AtomicU64 = AtomicU64::new(0);
+
+        struct MockTimePicker;
+
+        impl TimePicker for MockTimePicker {
+            fn now() -> u128 {
+                MOCK_TIME.load(Ordering::Relaxed) as u128
+            }
+        }
+
+        // Helper function to advance mock time
+        fn advance_mock_time(delta_ms: u64) {
+            MOCK_TIME.fetch_add(delta_ms, Ordering::Relaxed);
+        }
+
+        // 创建一个简单的mock writer用于测试
+        struct MockWriter {
+            future: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+        }
+
+        impl AsyncWrite for MockWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<Result<usize, io::Error>> {
+                if self.future.is_none() {
+                    self.future = Some(Box::pin(tokio::time::sleep(Duration::from_millis(10))));
+                }
+                match Pin::new(self.future.as_mut().unwrap()).poll(_cx) {
+                    Poll::Ready(_) => {
+                        self.future = None;
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), io::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>
+            ) -> Poll<Result<(), Error>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl Unpin for MockWriter {}
+
+        let writer = MockWriter{
+            future: None,
+        };
+        let mut stat_writer = StatWrite::new_test::<MockTimePicker>(writer);
+        let speed_stat = stat_writer.get_speed_stat();
+        let mut upload_size = 0;
+        let buf = vec![0u8; 4096];
+        advance_mock_time(500);
+        for i in 0..100 {
+            let size = stat_writer.write(&buf).await.unwrap();
+            stat_writer.flush().await.unwrap();
+            upload_size += size;
+            advance_mock_time(1000);
+            if i < 5 {
+                assert_eq!(speed_stat.get_write_speed(), (upload_size / 5) as u64);
+            } else {
+                assert_eq!(speed_stat.get_write_sum_size(), upload_size as u64);
+                assert_eq!(speed_stat.get_write_speed(), (4096 * 5 - 2048)/5);
+            }
+        }
+        stat_writer.shutdown().await.unwrap();
     }
 }
