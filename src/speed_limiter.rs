@@ -33,6 +33,26 @@ impl SpeedLimiter {
         }
     }
 
+    pub fn new_with_burst(upper: Option<SpeedLimiterRef>, rate: Option<NonZeroU32>, weight: Option<NonZeroU32>, burst: Option<NonZeroU32>) -> SpeedLimiterRef {
+        let rate = rate.unwrap_or(NonZeroU32::new(u32::MAX).unwrap());
+        let weight = weight.unwrap_or(NonZeroU32::new(64 * 1024).unwrap());
+        let burst = burst.unwrap_or(rate);
+        if rate.get() == u32::MAX {
+            Arc::new(SpeedLimiter {
+                upper,
+                limiter: RwLock::new((weight, Arc::new(None))),
+            })
+        } else {
+            Arc::new(SpeedLimiter {
+                upper,
+                limiter: RwLock::new((weight, Arc::new(
+                    Some(GovRateLimiter::direct(
+                        governor::Quota::per_second(rate)
+                            .allow_burst(burst)))))),
+            })
+        }
+    }
+
     pub fn set_limit(&self, rate: Option<NonZeroU32>, weight: Option<NonZeroU32>) {
         let rate = rate.unwrap_or(NonZeroU32::new(u32::MAX).unwrap());
         let weight = weight.unwrap_or(NonZeroU32::new(64 * 1024).unwrap());
