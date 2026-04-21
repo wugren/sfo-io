@@ -1,5 +1,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+use nonzero_ext::nonzero;
+use pin_project::pin_project;
 use std::io;
 use std::io::Error;
 use std::marker::PhantomData;
@@ -8,8 +10,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
-use nonzero_ext::nonzero;
-use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub trait SpeedStat: 'static + Send + Sync {
@@ -32,7 +32,10 @@ pub struct SystemTimePicker;
 
 impl TimePicker for SystemTimePicker {
     fn now() -> u128 {
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis()
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
     }
 }
 
@@ -62,7 +65,7 @@ impl<T: TimePicker> SpeedState<T> {
 
     pub fn add_data(&mut self, size: u64) {
         self.sum_size += size;
-        let now = T::now();
+        let now = T::now().max(self.last_time);
         self.clear_invalid_item(now);
 
         if now / 1000 == self.last_time / 1000 {
@@ -113,23 +116,21 @@ impl<T: TimePicker> SpeedState<T> {
                 offset = 1000;
                 sec += 1;
             }
-
         }
         self.last_time = now;
     }
 
     pub fn clear_invalid_item(&mut self, now: u128) {
         let now = (now / 1000) as u64;
-        self.data_items.retain(|item| {
-            (now - item.time) <= self.speed_duration.get()
-        });
+        self.data_items
+            .retain(|item| now.saturating_sub(item.time) <= self.speed_duration.get());
     }
 
     pub fn get_speed(&self) -> u64 {
-        let now = (T::now() / 1000) as u64;
+        let now = (T::now().max(self.last_time) / 1000) as u64;
         let mut sum_size = 0;
         for item in self.data_items.iter() {
-            if (now - item.time) <= self.speed_duration.get() && now != item.time {
+            if item.time < now && now.saturating_sub(item.time) <= self.speed_duration.get() {
                 sum_size += item.size;
             }
         }
@@ -154,7 +155,6 @@ impl SfoSpeedStat {
             download_state: Mutex::new(SpeedState::new(nonzero!(5u64))),
         }
     }
-
 
     /// Creates a new SfoSpeedStat instance with the specified duration
     ///
@@ -261,7 +261,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for StatStrea
                     this.stat.add_read_data_size(buf.filled().len() as u64);
                 }
                 Poll::Ready(res)
-            },
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -280,15 +280,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatStre
                     this.stat.add_write_data_size(buf.len() as u64);
                 }
                 Poll::Ready(res)
-            },
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         self.project().stream.poll_flush(cx)
     }
 
@@ -350,7 +347,7 @@ impl<T: AsyncRead + Unpin + Send + 'static> AsyncRead for StatRead<T> {
                     this.stat.add_read_data_size(buf.filled().len() as u64);
                 }
                 Poll::Ready(res)
-            },
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -409,15 +406,12 @@ impl<T: AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatWrite<T> {
                     this.stat.add_write_data_size(buf.len() as u64);
                 }
                 Poll::Ready(res)
-            },
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         self.project().writer.poll_flush(cx)
     }
 
@@ -704,6 +698,64 @@ mod tests {
     }
 
     #[test]
+    fn test_add_data_handles_clock_rollback() {
+        static MOCK_TIME: AtomicU64 = AtomicU64::new(0);
+
+        struct MockTimePicker;
+
+        impl TimePicker for MockTimePicker {
+            fn now() -> u128 {
+                MOCK_TIME.load(Ordering::Relaxed) as u128
+            }
+        }
+
+        fn set_mock_time(time_ms: u64) {
+            MOCK_TIME.store(time_ms, Ordering::Relaxed);
+        }
+
+        set_mock_time(10_000);
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
+        state.add_data(100);
+
+        set_mock_time(9_000);
+        state.add_data(50);
+
+        assert_eq!(state.get_sum_size(), 150);
+        assert_eq!(state.last_time, 10_000);
+        assert_eq!(state.data_items.len(), 1);
+        assert_eq!(state.data_items[0].time, 10);
+        assert_eq!(state.data_items[0].size, 150);
+    }
+
+    #[test]
+    fn test_speed_queries_handle_future_items_without_overflow() {
+        static MOCK_TIME: AtomicU64 = AtomicU64::new(0);
+
+        struct MockTimePicker;
+
+        impl TimePicker for MockTimePicker {
+            fn now() -> u128 {
+                MOCK_TIME.load(Ordering::Relaxed) as u128
+            }
+        }
+
+        fn set_mock_time(time_ms: u64) {
+            MOCK_TIME.store(time_ms, Ordering::Relaxed);
+        }
+
+        let mut state: SpeedState<MockTimePicker> = SpeedState::new(nonzero!(5u64));
+        state.data_items.push(DataItem {
+            size: 100,
+            time: 12,
+        });
+
+        set_mock_time(11_000);
+        state.clear_invalid_item(MockTimePicker::now());
+        assert_eq!(state.data_items.len(), 1);
+        assert_eq!(state.get_speed(), 0);
+    }
+
+    #[test]
     fn test_speed_stat_impl() {
         // Mock TimePicker for testing
         static MOCK_TIME: AtomicU64 = AtomicU64::new(0);
@@ -813,7 +865,7 @@ mod tests {
 
             fn poll_shutdown(
                 self: Pin<&mut Self>,
-                _cx: &mut Context<'_>
+                _cx: &mut Context<'_>,
             ) -> Poll<Result<(), Error>> {
                 Poll::Ready(Ok(()))
             }
@@ -821,9 +873,7 @@ mod tests {
 
         impl Unpin for MockStream {}
 
-        let stream = MockStream{
-            future: None,
-        };
+        let stream = MockStream { future: None };
         let mut stat_stream = StatStream::new_test::<MockTimePicker>(stream);
         let speed_stat = stat_stream.get_speed_stat();
         let mut upload_size = 0;
@@ -843,8 +893,8 @@ mod tests {
             } else {
                 assert_eq!(speed_stat.get_write_sum_size(), upload_size as u64);
                 assert_eq!(speed_stat.get_read_sum_size(), download_size as u64);
-                assert_eq!(speed_stat.get_write_speed(), (4096 * 5 - 2048)/5);
-                assert_eq!(speed_stat.get_read_speed(), (10 * 5 - 5)/5);
+                assert_eq!(speed_stat.get_write_speed(), (4096 * 5 - 2048) / 5);
+                assert_eq!(speed_stat.get_read_speed(), (10 * 5 - 5) / 5);
             }
         }
         stat_stream.shutdown().await.unwrap();
@@ -894,9 +944,7 @@ mod tests {
 
         impl Unpin for MockReader {}
 
-        let reader = MockReader{
-            future: None,
-        };
+        let reader = MockReader { future: None };
         let mut stat_reader = StatRead::new_test::<MockTimePicker>(reader);
         let speed_stat = stat_reader.get_speed_stat();
         let mut download_size = 0;
@@ -910,7 +958,7 @@ mod tests {
                 assert_eq!(speed_stat.get_read_speed(), (download_size / 5) as u64);
             } else {
                 assert_eq!(speed_stat.get_read_sum_size(), download_size as u64);
-                assert_eq!(speed_stat.get_read_speed(), (10 * 5 - 5)/5);
+                assert_eq!(speed_stat.get_read_speed(), (10 * 5 - 5) / 5);
             }
         }
     }
@@ -964,7 +1012,7 @@ mod tests {
 
             fn poll_shutdown(
                 self: Pin<&mut Self>,
-                _cx: &mut Context<'_>
+                _cx: &mut Context<'_>,
             ) -> Poll<Result<(), Error>> {
                 Poll::Ready(Ok(()))
             }
@@ -972,9 +1020,7 @@ mod tests {
 
         impl Unpin for MockWriter {}
 
-        let writer = MockWriter{
-            future: None,
-        };
+        let writer = MockWriter { future: None };
         let mut stat_writer = StatWrite::new_test::<MockTimePicker>(writer);
         let speed_stat = stat_writer.get_speed_stat();
         let mut upload_size = 0;
@@ -989,7 +1035,7 @@ mod tests {
                 assert_eq!(speed_stat.get_write_speed(), (upload_size / 5) as u64);
             } else {
                 assert_eq!(speed_stat.get_write_sum_size(), upload_size as u64);
-                assert_eq!(speed_stat.get_write_speed(), (4096 * 5 - 2048)/5);
+                assert_eq!(speed_stat.get_write_speed(), (4096 * 5 - 2048) / 5);
             }
         }
         stat_writer.shutdown().await.unwrap();
