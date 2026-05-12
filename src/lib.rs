@@ -2,19 +2,21 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 pub mod blocking;
-pub mod simple_async_io;
 mod buf;
-mod qa_process;
+mod copy_bidirectional;
 pub mod error;
+mod limit_datagram;
+mod limit_stream;
+mod qa_process;
+pub mod simple_async_io;
 pub mod speed_limiter;
 mod stat_stream;
-mod limit_stream;
-mod limit_datagram;
 
 pub use blocking::*;
-pub use simple_async_io::*;
-pub use qa_process::*;
-pub use speed_limiter::*;
-pub use limit_stream::*;
-pub use stat_stream::*;
+pub use copy_bidirectional::*;
 pub use limit_datagram::*;
+pub use limit_stream::*;
+pub use qa_process::*;
+pub use simple_async_io::*;
+pub use speed_limiter::*;
+pub use stat_stream::*;

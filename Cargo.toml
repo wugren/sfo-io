@@ -1,10 +1,15 @@
 [package]
 name = "sfo-io"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 repository = "https://github.com/wugren/sfo-io.git"
 license-file = "LICENSE"
 description = "A Rust library for handling IO operations, providing asynchronous read/write and stream processing capabilities."
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "src/**",
+]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
