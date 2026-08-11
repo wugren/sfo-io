@@ -255,10 +255,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncRead for StatStrea
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.project();
+        let filled_len = buf.filled().len();
         match this.stream.poll_read(cx, buf) {
             Poll::Ready(res) => {
                 if res.is_ok() {
-                    this.stat.add_read_data_size(buf.filled().len() as u64);
+                    this.stat
+                        .add_read_data_size((buf.filled().len() - filled_len) as u64);
                 }
                 Poll::Ready(res)
             }
@@ -275,12 +277,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatStre
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.project();
         match this.stream.poll_write(cx, buf) {
-            Poll::Ready(res) => {
-                if res.is_ok() {
-                    this.stat.add_write_data_size(buf.len() as u64);
-                }
-                Poll::Ready(res)
+            Poll::Ready(Ok(size)) => {
+                this.stat.add_write_data_size(size as u64);
+                Poll::Ready(Ok(size))
             }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -341,10 +342,12 @@ impl<T: AsyncRead + Unpin + Send + 'static> AsyncRead for StatRead<T> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.project();
+        let filled_len = buf.filled().len();
         match this.reader.poll_read(cx, buf) {
             Poll::Ready(res) => {
                 if res.is_ok() {
-                    this.stat.add_read_data_size(buf.filled().len() as u64);
+                    this.stat
+                        .add_read_data_size((buf.filled().len() - filled_len) as u64);
                 }
                 Poll::Ready(res)
             }
@@ -401,12 +404,11 @@ impl<T: AsyncWrite + Unpin + Send + 'static> AsyncWrite for StatWrite<T> {
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.project();
         match this.writer.poll_write(cx, buf) {
-            Poll::Ready(res) => {
-                if res.is_ok() {
-                    this.stat.add_write_data_size(buf.len() as u64);
-                }
-                Poll::Ready(res)
+            Poll::Ready(Ok(size)) => {
+                this.stat.add_write_data_size(size as u64);
+                Poll::Ready(Ok(size))
             }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -426,6 +428,139 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct PartialStream {
+        max_write_size: usize,
+        read_size: usize,
+    }
+
+    impl AsyncRead for PartialStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let size = self.read_size.min(buf.remaining());
+            buf.put_slice(&[0; 3][..size]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PartialStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, io::Error>> {
+            Poll::Ready(Ok(self.max_write_size.min(buf.len())))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stat_stream_partial_write_counts_returned_size() {
+        let tracker = Arc::new(SfoSpeedStat::new());
+        let stream = PartialStream {
+            max_write_size: 3,
+            read_size: 0,
+        };
+        let mut stream = StatStream::new_with_tracker(stream, tracker.clone());
+
+        let written = stream.write(&[0; 10]).await.unwrap();
+
+        assert_eq!(written, 3);
+        assert_eq!(tracker.get_write_sum_size(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_stat_stream_partial_read_counts_newly_filled_size() {
+        let tracker = Arc::new(SfoSpeedStat::new());
+        let stream = PartialStream {
+            max_write_size: 0,
+            read_size: 3,
+        };
+        let mut stream = StatStream::new_with_tracker(stream, tracker.clone());
+        let mut storage = [0; 10];
+        let mut buf = ReadBuf::new(&mut storage);
+        buf.put_slice(&[0; 4]);
+
+        let result =
+            futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut buf)).await;
+
+        assert!(result.is_ok());
+        assert_eq!(buf.filled().len(), 7);
+        assert_eq!(tracker.get_read_sum_size(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_stat_stream_counts_only_transferred_bytes() {
+        let tracker = Arc::new(SfoSpeedStat::new());
+        let stream = PartialStream {
+            max_write_size: 3,
+            read_size: 3,
+        };
+        let mut stream = StatStream::new_with_tracker(stream, tracker.clone());
+
+        stream.write_all(&[0; 10]).await.unwrap();
+        assert_eq!(tracker.get_write_sum_size(), 10);
+
+        let mut storage = [0; 10];
+        let mut buf = ReadBuf::new(&mut storage);
+        buf.put_slice(&[0; 4]);
+        let result =
+            futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut buf)).await;
+
+        assert!(result.is_ok());
+        assert_eq!(buf.filled().len(), 7);
+        assert_eq!(tracker.get_read_sum_size(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_split_stat_io_counts_only_transferred_bytes() {
+        let write_tracker = Arc::new(SfoSpeedStat::new());
+        let writer = PartialStream {
+            max_write_size: 3,
+            read_size: 0,
+        };
+        let mut writer = StatWrite::new_with_tracker(writer, write_tracker.clone());
+
+        writer.write_all(&[0; 10]).await.unwrap();
+        assert_eq!(write_tracker.get_write_sum_size(), 10);
+
+        let zero_tracker = Arc::new(SfoSpeedStat::new());
+        let zero_writer = PartialStream {
+            max_write_size: 0,
+            read_size: 0,
+        };
+        let mut zero_writer = StatWrite::new_with_tracker(zero_writer, zero_tracker.clone());
+        let err = zero_writer.write_all(&[0]).await.unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(zero_tracker.get_write_sum_size(), 0);
+
+        let read_tracker = Arc::new(SfoSpeedStat::new());
+        let reader = PartialStream {
+            max_write_size: 0,
+            read_size: 3,
+        };
+        let mut reader = StatRead::new_with_tracker(reader, read_tracker.clone());
+        let mut storage = [0; 10];
+        let mut buf = ReadBuf::new(&mut storage);
+        buf.put_slice(&[0; 4]);
+        let result =
+            futures::future::poll_fn(|cx| Pin::new(&mut reader).poll_read(cx, &mut buf)).await;
+
+        assert!(result.is_ok());
+        assert_eq!(buf.filled().len(), 7);
+        assert_eq!(read_tracker.get_read_sum_size(), 3);
+    }
 
     #[test]
     fn test_speed_state_new() {
