@@ -8,7 +8,8 @@ type GovRateLimiter = governor::RateLimiter<NotKeyed, InMemoryState, clock::Defa
 
 pub struct SpeedLimiter {
     upper: Option<SpeedLimiterRef>,
-    limiter: RwLock<(NonZeroU32, Arc<Option<GovRateLimiter>>)>,
+    // Weight, governor instance, and the configured rate (including the unlimited sentinel).
+    limiter: RwLock<(NonZeroU32, Arc<Option<GovRateLimiter>>, NonZeroU32)>,
 }
 
 pub type SpeedLimiterRef = Arc<SpeedLimiter>;
@@ -20,7 +21,7 @@ impl SpeedLimiter {
         if rate.get() == u32::MAX {
             Arc::new(SpeedLimiter {
                 upper,
-                limiter: RwLock::new((weight, Arc::new(None))),
+                limiter: RwLock::new((weight, Arc::new(None), rate)),
             })
         } else {
             Arc::new(SpeedLimiter {
@@ -28,7 +29,7 @@ impl SpeedLimiter {
                 limiter: RwLock::new((weight, Arc::new(
                     Some(GovRateLimiter::direct(
                         governor::Quota::per_second(rate)
-                            .allow_burst(rate)))))),
+                            .allow_burst(rate)))), rate)),
             })
         }
     }
@@ -40,7 +41,7 @@ impl SpeedLimiter {
         if rate.get() == u32::MAX {
             Arc::new(SpeedLimiter {
                 upper,
-                limiter: RwLock::new((weight, Arc::new(None))),
+                limiter: RwLock::new((weight, Arc::new(None), rate)),
             })
         } else {
             Arc::new(SpeedLimiter {
@@ -48,7 +49,7 @@ impl SpeedLimiter {
                 limiter: RwLock::new((weight, Arc::new(
                     Some(GovRateLimiter::direct(
                         governor::Quota::per_second(rate)
-                            .allow_burst(burst)))))),
+                            .allow_burst(burst)))), rate)),
             })
         }
     }
@@ -56,13 +57,17 @@ impl SpeedLimiter {
     pub fn set_limit(&self, rate: Option<NonZeroU32>, weight: Option<NonZeroU32>) {
         let rate = rate.unwrap_or(NonZeroU32::new(u32::MAX).unwrap());
         let weight = weight.unwrap_or(NonZeroU32::new(64 * 1024).unwrap());
+        let mut limiter = self.limiter.write().unwrap();
+        if limiter.2 == rate && limiter.0 == weight {
+            return;
+        }
         if rate.get() == u32::MAX {
-            *self.limiter.write().unwrap() = (weight, Arc::new(None));
+            *limiter = (weight, Arc::new(None), rate);
         } else {
-            *self.limiter.write().unwrap() = (weight, Arc::new(Some(
+            *limiter = (weight, Arc::new(Some(
                 GovRateLimiter::direct(
                     governor::Quota::per_second(rate)
-                        .allow_burst(rate)))));
+                        .allow_burst(rate)))), rate);
         }
     }
 
@@ -78,7 +83,8 @@ impl SpeedLimiter {
 
     async fn until_ready(&self) -> usize {
         let (piece_size, limiter) = {
-            self.limiter.read().unwrap().clone()
+            let limiter = self.limiter.read().unwrap();
+            (limiter.0, limiter.1.clone())
         };
         if limiter.is_none() {
             piece_size.get() as usize
@@ -192,6 +198,88 @@ mod tests {
         let limiter_data = rate_limiter.limiter.read().unwrap();
         assert_eq!(limiter_data.0.get(), 3);
         assert!(limiter_data.1.is_some());
+    }
+
+    #[test]
+    fn test_set_limit_same_rate_and_weight_preserves_bucket() {
+        let rate_limiter = SpeedLimiter::new(None, Some(nz_u32(1)), Some(nz_u32(1)));
+        let original = rate_limiter.limiter.read().unwrap().1.clone();
+        assert!(original.as_ref().as_ref().unwrap().check().is_ok());
+
+        rate_limiter.set_limit(Some(nz_u32(1)), Some(nz_u32(1)));
+
+        let limiter_data = rate_limiter.limiter.read().unwrap();
+        assert_eq!(limiter_data.0.get(), 1);
+        assert!(Arc::ptr_eq(&original, &limiter_data.1));
+        assert!(limiter_data.1.as_ref().as_ref().unwrap().check().is_err());
+    }
+
+    #[test]
+    fn test_set_limit_same_rate_and_weight_preserves_custom_burst() {
+        let rate_limiter = SpeedLimiter::new_with_burst(
+            None, Some(nz_u32(1)), None, Some(nz_u32(2)),
+        );
+        let original = rate_limiter.limiter.read().unwrap().1.clone();
+        assert!(matches!(original.as_ref().as_ref().unwrap().check_n(nz_u32(2)), Ok(Ok(()))));
+
+        rate_limiter.set_limit(Some(nz_u32(1)), None);
+
+        let limiter_data = rate_limiter.limiter.read().unwrap();
+        assert_eq!(limiter_data.0.get(), 64 * 1024);
+        assert!(Arc::ptr_eq(&original, &limiter_data.1));
+        assert!(limiter_data.1.as_ref().as_ref().unwrap().check().is_err());
+    }
+
+    #[test]
+    fn test_set_limit_same_unlimited_rate_and_weight_reuses_instance() {
+        let rate_limiter = SpeedLimiter::new(None, None, Some(nz_u32(5)));
+        let original = rate_limiter.limiter.read().unwrap().1.clone();
+
+        for rate in [Some(nz_u32(u32::MAX)), None] {
+            rate_limiter.set_limit(rate, Some(nz_u32(5)));
+            let limiter_data = rate_limiter.limiter.read().unwrap();
+            assert_eq!(limiter_data.0.get(), 5);
+            assert!(limiter_data.1.is_none());
+            assert!(Arc::ptr_eq(&original, &limiter_data.1));
+        }
+    }
+
+    #[test]
+    fn test_set_limit_changed_weight_replaces_bucket() {
+        let rate_limiter = SpeedLimiter::new(None, Some(nz_u32(1)), Some(nz_u32(1)));
+        let mut previous = rate_limiter.limiter.read().unwrap().1.clone();
+        assert!(previous.as_ref().as_ref().unwrap().check().is_ok());
+
+        for weight in [Some(nz_u32(5)), None] {
+            rate_limiter.set_limit(Some(nz_u32(1)), weight);
+            let updated = rate_limiter.limiter.read().unwrap().1.clone();
+            assert!(!Arc::ptr_eq(&previous, &updated));
+            assert!(updated.as_ref().as_ref().unwrap().check().is_ok());
+
+            rate_limiter.set_limit(Some(nz_u32(1)), weight);
+            let limiter_data = rate_limiter.limiter.read().unwrap();
+            assert_eq!(limiter_data.0, weight.unwrap_or(nz_u32(64 * 1024)));
+            assert!(Arc::ptr_eq(&updated, &limiter_data.1));
+            assert!(limiter_data.1.as_ref().as_ref().unwrap().check().is_err());
+            previous = updated;
+        }
+    }
+
+    #[test]
+    fn test_set_limit_changed_rate_replaces_bucket() {
+        // These rates have the same nanosecond refill interval but are distinct settings.
+        let rate_limiter = SpeedLimiter::new(None, Some(nz_u32(1_000_000_000)), Some(nz_u32(3)));
+        let original = rate_limiter.limiter.read().unwrap().1.clone();
+
+        rate_limiter.set_limit(Some(nz_u32(1_000_000_001)), Some(nz_u32(3)));
+
+        let updated = rate_limiter.limiter.read().unwrap().1.clone();
+        assert!(!Arc::ptr_eq(&original, &updated));
+
+        rate_limiter.set_limit(Some(nz_u32(1_000_000_001)), Some(nz_u32(3)));
+        let limiter_data = rate_limiter.limiter.read().unwrap();
+        assert_eq!(limiter_data.0.get(), 3);
+        assert!(Arc::ptr_eq(&updated, &limiter_data.1));
     }
 
     /// 测试 new_limit_session 不带上级限制器
